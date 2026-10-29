@@ -6,6 +6,7 @@ import (
 	"math"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/khenrix/home-sound/internal/audio"
@@ -154,5 +155,53 @@ func TestBlockBoundariesPreserveLagAndAmbiguity(t *testing.T) {
 	copy(rec[100000:], ref)
 	if _, err := Analyze(audio.Canonical, ref, audio.Canonical, rec); err == nil {
 		t.Fatal("accepted duplicate peaks in different blocks")
+	}
+}
+
+func TestRejectOppositeChannelNoiseDespiteCleanDownmix(t *testing.T) {
+	ref := reference(48000)
+	noise := referenceDifferent(48000)
+	rec := make([]float32, len(ref)+960)
+	for i := 0; i < 48000; i++ {
+		signal := ref[i*2] * 0.1
+		n := noise[i*2] * 0.6
+		rec[960+i*2] = signal + n
+		rec[960+i*2+1] = signal - n
+	}
+	if _, err := Analyze(audio.Canonical, ref, audio.Canonical, rec); err == nil {
+		t.Fatal("accepted recording with low SNR in both channels")
+	}
+}
+
+func TestRejectClippedReference(t *testing.T) {
+	ref := reference(48000)
+	rec := make([]float32, len(ref)+960)
+	for i := range ref {
+		if ref[i] < 0 {
+			ref[i] = -1
+		} else {
+			ref[i] = 32767.0 / 32768
+		}
+		rec[960+i] = ref[i] * 0.5
+	}
+	_, err := Analyze(audio.Canonical, ref, audio.Canonical, rec)
+	if err == nil {
+		t.Fatal("accepted clipped reference")
+	}
+	if !strings.Contains(err.Error(), "reference") {
+		t.Fatalf("clipping error does not identify reference: %v", err)
+	}
+}
+
+func TestRejectNoiseInOnlyOneChannel(t *testing.T) {
+	ref := reference(48000)
+	noise := referenceDifferent(48000)
+	rec := make([]float32, len(ref)+960)
+	for i := 0; i < 48000; i++ {
+		rec[960+i*2] = ref[i*2] * 0.1
+		rec[960+i*2+1] = ref[i*2+1]*0.1 + noise[i*2]*0.6
+	}
+	if _, err := Analyze(audio.Canonical, ref, audio.Canonical, rec); err == nil {
+		t.Fatal("accepted low SNR in right channel")
 	}
 }

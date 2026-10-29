@@ -38,12 +38,19 @@ func Analyze(rf audio.Format, ref []float32, cf audio.Format, rec []float32) (Re
 	a := make([]float64, len(ref)/2)
 	b := make([]float64, len(rec)/2)
 	clipped := 0
+	referenceClipped := 0
 	for i := range a {
 		x, y := float64(ref[2*i]), float64(ref[2*i+1])
 		if math.IsNaN(x) || math.IsNaN(y) || math.IsInf(x, 0) || math.IsInf(y, 0) {
 			return out, errors.New("nonfinite reference")
 		}
+		if math.Abs(x) >= 0.999 || math.Abs(y) >= 0.999 {
+			referenceClipped++
+		}
 		a[i] = (x + y) / 2
+	}
+	if float64(referenceClipped)/float64(len(a)) > 0.001 {
+		return out, errors.New("reference clipped")
 	}
 	for i := range b {
 		x, y := float64(rec[2*i]), float64(rec[2*i+1])
@@ -82,11 +89,29 @@ func Analyze(rf audio.Format, ref []float32, cf audio.Format, rec []float32) (Re
 		return out, errors.New("incomplete reference in recording")
 	}
 	var rr, yy, ry float64
+	var channelRR, channelYY, channelRY [2]float64
 	for i, x := range a {
 		y := b[lag+i]
 		rr += x * x
 		yy += y * y
 		ry += x * y
+		for ch := 0; ch < 2; ch++ {
+			cx, cy := float64(ref[2*i+ch]), float64(rec[2*(lag+i)+ch])
+			channelRR[ch] += cx * cx
+			channelYY[ch] += cy * cy
+			channelRY[ch] += cx * cy
+		}
+	}
+	for ch := 0; ch < 2; ch++ {
+		r, y, c := channelRR[ch], channelYY[ch], channelRY[ch]
+		if r < 1e-8 || y < 1e-8 || c <= 0 {
+			return out, errors.New("inadequate signal in recording channel")
+		}
+		signal := c * c / r
+		residual := math.Max(y-signal, 1e-20)
+		if 10*math.Log10(signal/residual) < 10 {
+			return out, errors.New("inadequate signal to noise ratio in recording channel")
+		}
 	}
 	if rr < 1e-8 || yy < 1e-8 || ry <= 0 {
 		return out, errors.New("silent or inverted signal")
