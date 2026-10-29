@@ -314,7 +314,7 @@ func TestLGPostReadyFailure(t *testing.T) {
 // Catches loss of DACP identity and credential disclosure on pairing failure.
 func TestPairPersistsIdentity(t *testing.T) {
 	cfg := fixture(t, "pair")
-	cfg.PairingFile = filepath.Join(t.TempDir(), "pair.json")
+	cfg.PairingFile = filepath.Join(privateFixtureDir(t), "pair.json")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if err := Pair(ctx, cfg, strings.NewReader("1234\n")); err != nil {
@@ -327,7 +327,7 @@ func TestPairPersistsIdentity(t *testing.T) {
 }
 func TestPairFailureRedacted(t *testing.T) {
 	cfg := fixture(t, "pairfail")
-	cfg.PairingFile = filepath.Join(t.TempDir(), "pair.json")
+	cfg.PairingFile = filepath.Join(privateFixtureDir(t), "pair.json")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	err := Pair(ctx, cfg, strings.NewReader("1234\n"))
@@ -467,7 +467,7 @@ func TestNativeLGOrderingOverWebSocket(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	wc := webos.Config{URL: "ws" + strings.TrimPrefix(srv.URL, "http"), PairingFile: filepath.Join(t.TempDir(), "lg.json")}
+	wc := webos.Config{URL: "ws" + strings.TrimPrefix(srv.URL, "http"), PairingFile: filepath.Join(privateFixtureDir(t), "lg.json")}
 	c, e := webos.Connect(ctx, wc, true)
 	if e != nil {
 		t.Fatal(e)
@@ -529,4 +529,15 @@ func TestStopRequestsReceiverTeardown(t *testing.T) {
 	if _, e := os.Stat(cfg.Helper + ".order.stopped"); e != nil {
 		t.Fatal("helper was killed without receiver STOP")
 	}
+}
+
+// Pairing intentionally rejects public parents, including test temp directories
+// created under CI's usual umask 022.
+func privateFixtureDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }

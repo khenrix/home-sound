@@ -10,6 +10,7 @@ import (
 	"github.com/khenrix/home-sound/internal/pairing"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -61,9 +62,11 @@ func TestRegistrationVolumeAndSubscription(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
-	path := filepath.Join(t.TempDir(), "lg.json")
+	path := filepath.Join(privateFixtureDir(t), "lg.json")
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	pairing.Save(path, credentials{Endpoint: url, ClientKey: "test-key"})
+	if err := pairing.Save(path, credentials{Endpoint: url, ClientKey: "test-key"}); err != nil {
+		t.Fatal(err)
+	}
 	c, err := Connect(ctx, Config{URL: url, PairingFile: path}, false)
 	if err != nil {
 		t.Fatal(err)
@@ -113,7 +116,7 @@ func TestPinnedTLSRegistration(t *testing.T) {
 	}))
 	defer srv.Close()
 	sum := sha256.Sum256(srv.Certificate().Raw)
-	cfg := Config{URL: "wss" + strings.TrimPrefix(srv.URL, "https"), PairingFile: filepath.Join(t.TempDir(), "lg.json"), CertificateSHA256: hex.EncodeToString(sum[:])}
+	cfg := Config{URL: "wss" + strings.TrimPrefix(srv.URL, "https"), PairingFile: filepath.Join(privateFixtureDir(t), "lg.json"), CertificateSHA256: hex.EncodeToString(sum[:])}
 	c, e := Connect(ctx, cfg, true)
 	if e != nil {
 		t.Fatal(e)
@@ -124,4 +127,15 @@ func TestPinnedTLSRegistration(t *testing.T) {
 		c.Close()
 		t.Fatal("accepted wrong server certificate")
 	}
+}
+
+// Pairing intentionally rejects public parents, including test temp directories
+// created under CI's usual umask 022.
+func privateFixtureDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }

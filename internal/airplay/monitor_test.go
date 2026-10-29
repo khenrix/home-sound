@@ -107,7 +107,7 @@ func TestNativeLGPeriodicReadbackFailure(t *testing.T) {
 				}
 			}))
 			defer srv.Close()
-			c, err := webos.Connect(ctx, webos.Config{URL: "ws" + strings.TrimPrefix(srv.URL, "http"), PairingFile: filepath.Join(t.TempDir(), "lg.json")}, true)
+			c, err := webos.Connect(ctx, webos.Config{URL: "ws" + strings.TrimPrefix(srv.URL, "http"), PairingFile: filepath.Join(privateFixtureDir(t), "lg.json")}, true)
 			if err != nil {
 				t.Fatal(err)
 			}
