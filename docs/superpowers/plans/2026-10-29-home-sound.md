@@ -50,7 +50,7 @@
 **Interfaces:** Consume Task 1 WAV/format. Produce Capture interface with context cancellation, read frame/sample counters and capture status. Initially wrap one persistent arecord ALSA process (not a shell), explicitly hw:CARD=PCH,DEV=0 or user-selected device. Produce analysis report with reference/recording rate, correlation lag, relative level, noise/clipping/confidence and unverified absolute SPL. CLI record and analyze commands; recordings max60s, default5s, restrictive file mode.
 
 - [ ] Test missing device/helper, nonzero exit, truncated PCM, bounded duration, cancellation and child cleanup using real controlled subprocess fixtures. Test independently constructed shifted/scaled signals with drift, silence/noise/clipping rejection and ambiguous peaks.
-- [ ] Observe RED, implement capture and analysis. Use cross-correlation with sufficient efficiency for real recordings; reject uncertainty >2ms and level comparisons with inadequate SNR rather than return a confident mapping. Keep no background mic listener.
+- [ ] Observe RED, implement capture and analysis. Add signal -kind probe producing deterministic broadband reference suitable for unambiguous correlation; the Task1 sine is for basic audio only. Use cross-correlation with sufficient efficiency for real recordings; reject uncertainty >2ms and level comparisons with inadequate SNR rather than return a confident mapping. Keep no background mic listener.
 - [ ] Full suite/race/vet plus CLI capture fixture. Commit/report. Controller separately verifies actual Mac ALSA access/format and source attribution; no claim of hardware pass from fixtures.
 
 ### Task 3: Direct AirPlay output and native LG control
