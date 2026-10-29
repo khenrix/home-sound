@@ -140,6 +140,28 @@ func (a *Adapter) gate(ctx context.Context) error {
 	}
 	return nil
 }
+
+// Subscription silence cannot distinguish unchanged volume from lost native control.
+// Keep readback independent so a wedged request never delays unsafe volume events.
+func (a *Adapter) pollNativeVolume(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			readCtx, cancel := context.WithTimeout(ctx, time.Second)
+			v, err := a.cfg.LG.Volume(readCtx)
+			expired := readCtx.Err() != nil
+			cancel()
+			if err != nil || expired || !v.Valid || v.Muted || v.Level < 0 || v.Level > 15 {
+				a.fail()
+				return
+			}
+		}
+	}
+}
 func (a *Adapter) Prepare(ctx context.Context, epoch, first uint64) (resultErr error) {
 	a.op.Lock()
 	defer a.op.Unlock()
@@ -274,6 +296,7 @@ func (a *Adapter) Prepare(ctx context.Context, epoch, first uint64) (resultErr e
 			a.fail()
 			return errors.New("native LG subscription not acknowledged")
 		}
+		go a.pollNativeVolume(childCtx)
 		go func() {
 			for {
 				select {
