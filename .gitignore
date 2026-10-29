@@ -1,0 +1,11 @@
+.superpowers/
+.state/
+.runtime/
+bin/
+dist/
+*.wav
+*.pcm
+*.raw
+.env
+.env.*
+node_modules/
