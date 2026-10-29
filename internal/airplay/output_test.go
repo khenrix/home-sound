@@ -47,6 +47,10 @@ func TestHelperProcess(t *testing.T) {
 	if mode == "offset" && get("--clock-offset-ns") != "-123456789" {
 		os.Exit(5)
 	}
+	if mode == "error_status" {
+		fmt.Fprintln(os.Stderr, `[STATUS] error code=connect_failed http=503 detail="secret-canary"`)
+		os.Exit(2)
+	}
 	if mode == "exit" {
 		fmt.Println("[STATUS] error code=oops detail=synthetic-secret")
 		os.Exit(2)
@@ -70,9 +74,34 @@ func TestHelperProcess(t *testing.T) {
 		}
 		os.WriteFile(p, []byte("connected"), 0600)
 	}
+	if mode == "ntp_cold" {
+		fmt.Println("[STATUS] route protocol=airplay2 flow=native timing=ntp buffered=0")
+		fmt.Println("[STATUS] latency lead_ms=2000 device_min_frames=0 device_max_frames=0 device_render_ms=0 warm_lead_ms=0")
+		fmt.Println("[STATUS] capabilities requested=0x0 realtime_formats=0x0 realtime_known=0 buffered_formats=0x0 buffered_known=0")
+	}
 	fmt.Fprintln(os.Stderr, "[STATUS] connected")
-	if mode != "cold" {
-		fmt.Fprintln(os.Stderr, "[STATUS] clock_ready mode=ntp state=ready streak_ms=0 exchanges=1 ready_in_ms=0 ready_at_unix_ms=0")
+	switch mode {
+	case "cold":
+	case "ntp_cold":
+		fmt.Fprintln(os.Stderr, "[STATUS] clock_ready mode=ntp state=cold streak_ms=0 exchanges=0 ready_in_ms=0 ready_at_unix_ms=0")
+	case "unknown_clock":
+		fmt.Fprintln(os.Stderr, "[STATUS] clock_ready mode=secret-canary state=ready streak_ms=0 exchanges=1 ready_in_ms=0 ready_at_unix_ms=0")
+	case "missing_clock_mode":
+		fmt.Fprintln(os.Stderr, "[STATUS] clock_ready state=ready streak_ms=0 exchanges=1 ready_in_ms=0 ready_at_unix_ms=0")
+	case "bad_clock_number":
+		fmt.Fprintln(os.Stderr, "[STATUS] clock_ready mode=ptp state=ready streak_ms=0 exchanges=oops ready_in_ms=0 ready_at_unix_ms=0")
+	case "ntp_badstate":
+		fmt.Fprintln(os.Stderr, "[STATUS] clock_ready mode=ntp state=ready streak_ms=0 exchanges=0 ready_in_ms=0 ready_at_unix_ms=0")
+	case "ntp_nonzero":
+		fmt.Fprintln(os.Stderr, "[STATUS] clock_ready mode=ntp state=cold streak_ms=0 exchanges=1 ready_in_ms=0 ready_at_unix_ms=0")
+	case "ptp_cold":
+		fmt.Fprintln(os.Stderr, "[STATUS] clock_ready mode=ptp state=cold streak_ms=0 exchanges=0 ready_in_ms=0 ready_at_unix_ms=0")
+	case "ptp_probing":
+		fmt.Fprintln(os.Stderr, "[STATUS] clock_ready mode=ptp state=probing streak_ms=1000000 exchanges=1 ready_in_ms=1000 ready_at_unix_ms=1001000")
+	case "ptp_stalled":
+		fmt.Fprintln(os.Stderr, "[STATUS] clock_ready mode=ptp state=stalled streak_ms=0 exchanges=0 ready_in_ms=0 ready_at_unix_ms=0")
+	default:
+		fmt.Fprintln(os.Stderr, "[STATUS] clock_ready mode=ptp state=ready streak_ms=1000000 exchanges=8 ready_in_ms=0 ready_at_unix_ms=1001000")
 	}
 	if mode != "blocked" && mode != "pcm" {
 		go io.Copy(io.Discard, os.Stdin)

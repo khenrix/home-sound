@@ -53,7 +53,7 @@ func TestCLIHelperProcess(t *testing.T) {
 		os.Exit(2)
 	}
 	defer f.Close()
-	fmt.Fprintln(os.Stderr, "[STATUS] connected\n[STATUS] clock_ready mode=ntp state=ready streak_ms=0 exchanges=1 ready_in_ms=0 ready_at_unix_ms=0")
+	fmt.Fprintln(os.Stderr, "[STATUS] connected\n[STATUS] clock_ready mode=ntp state=cold streak_ms=0 exchanges=0 ready_in_ms=0 ready_at_unix_ms=0")
 	go io.Copy(io.Discard, os.Stdin)
 	s := bufio.NewScanner(f)
 	requested := ""
@@ -90,7 +90,7 @@ func TestBoundedSpeakerProofCommand(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if !strings.Contains(out.String(), `"Frames":480`) || !strings.Contains(out.String(), `"Epoch":1`) {
+	if !strings.Contains(out.String(), `"Frames":480`) || !strings.Contains(out.String(), `"Epoch":1`) || !strings.Contains(out.String(), `"ClockMode":"ntp"`) || !strings.Contains(out.String(), `"ClockMeasurementKnown":false`) || !strings.Contains(out.String(), `"ClockReady":false`) {
 		t.Fatalf("missing proof evidence: %s", out.String())
 	}
 }

@@ -41,8 +41,15 @@ type Anchor struct {
 	Requested, At                time.Time
 	Corrected, ContentCutPending bool
 }
+
+// Status separates transport readiness from receiver clock measurement.
+// NTP can be Ready while ClockReady and ClockMeasurementKnown remain false.
 type Status struct {
 	Healthy, Connected, ClockReady, Ready bool
+	ClockMode, ClockState                 string
+	ClockMeasurementKnown                 bool
+	HelperErrorCode                       string
+	HelperHTTPStatus                      int
 	Anchor                                Anchor
 	Frames                                uint64
 }
@@ -269,7 +276,7 @@ func (a *Adapter) Prepare(ctx context.Context, epoch, first uint64) (resultErr e
 		os.RemoveAll(dir)
 		close(done)
 	}()
-	if e = a.wait(ctx, func(s Status) bool { return s.Connected && s.ClockReady }); e != nil {
+	if e = a.wait(ctx, func(s Status) bool { return s.Connected && clockAllowsStart(s) }); e != nil {
 		a.fail()
 		return e
 	}
@@ -329,6 +336,9 @@ func (a *Adapter) wait(ctx context.Context, predicate func(Status) bool) error {
 		s, ch := a.status, a.changed
 		a.mu.Unlock()
 		if !s.Healthy {
+			if s.HelperErrorCode != "" {
+				return fmt.Errorf("AirPlay helper failed (code=%s http=%d)", s.HelperErrorCode, s.HelperHTTPStatus)
+			}
 			return errors.New("AirPlay helper failed")
 		}
 		if predicate(s) {
@@ -399,7 +409,7 @@ func (a *Adapter) Start(ctx context.Context, epoch uint64, at time.Time) (Anchor
 	a.op.Lock()
 	defer a.op.Unlock()
 	a.mu.Lock()
-	if !a.status.Ready || !a.status.Healthy || !a.status.ClockReady || epoch != a.epoch || a.pending != 0 || at.UnixMilli() <= 0 {
+	if !a.status.Ready || !a.status.Healthy || !clockAllowsStart(a.status) || epoch != a.epoch || a.pending != 0 || at.UnixMilli() <= 0 {
 		a.mu.Unlock()
 		return Anchor{}, errors.New("invalid or stale start")
 	}

@@ -112,7 +112,11 @@ func TestNativeLGPeriodicReadbackFailure(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer c.Close()
-			cfg := fixture(t, "ready")
+			helperMode := "ready"
+			if mode == "wedged" {
+				helperMode = "ntp_cold"
+			}
+			cfg := fixture(t, helperMode)
 			cfg.InitialVolume = 0
 			cfg.LG = c
 			o, err := New(cfg)
