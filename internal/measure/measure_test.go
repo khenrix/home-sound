@@ -1,7 +1,11 @@
 package measure
 
 import (
+	"bytes"
+	"encoding/json"
 	"math"
+	"runtime"
+	"strconv"
 	"testing"
 
 	"github.com/khenrix/home-sound/internal/audio"
@@ -79,7 +83,76 @@ func TestReportsResidualNoiseAndTimingUncertainty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.NoiseDBFS > -45 || got.NoiseDBFS < -70 || got.UncertaintyMS > 2 {
+	if got.NoiseDBFS > -45 || got.NoiseDBFS < -70 || got.PeakUncertaintyHeuristicMS > 2 {
 		t.Fatalf("unexpected noise or uncertainty: %+v", got)
+	}
+}
+
+func TestLongRecordingUsesBoundedCorrelationMemory(t *testing.T) {
+	ref := reference(48000)
+	rec := make([]float32, 60*48000*2)
+	for i, v := range ref {
+		rec[i+960] = v * 0.5
+	}
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	report, err := Analyze(audio.Canonical, ref, audio.Canonical, rec)
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.LagSamples != 480 {
+		t.Fatalf("lag = %d", report.LagSamples)
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 120<<20 {
+		t.Fatalf("analysis allocated %d bytes; expected bounded windows", allocated)
+	}
+}
+
+func TestReportLabelsHeuristicsAndUnverifiedEligibility(t *testing.T) {
+	ref := reference(48000)
+	rec := make([]float32, len(ref)+960)
+	for i, v := range ref {
+		rec[i+960] = v * 0.5
+	}
+	report, err := Analyze(audio.Canonical, ref, audio.Canonical, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Quality != "heuristic" || report.CalibrationEligibility != "not_acoustically_verified" {
+		t.Fatalf("misleading quality state: %+v", report)
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte(`"correlation_confidence_heuristic"`)) || !bytes.Contains(data, []byte(`"peak_uncertainty_heuristic_ms"`)) {
+		t.Fatalf("JSON lacks heuristic labels: %s", data)
+	}
+}
+
+func TestBlockBoundariesPreserveLagAndAmbiguity(t *testing.T) {
+	ref := reference(48000)
+	for _, lag := range []int{32767, 32768} {
+		t.Run(strconv.Itoa(lag), func(t *testing.T) {
+			rec := make([]float32, (lag+48000)*2)
+			for i, v := range ref {
+				rec[lag*2+i] = v * 0.5
+			}
+			report, err := Analyze(audio.Canonical, ref, audio.Canonical, rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.LagSamples != lag {
+				t.Fatalf("lag %d, want %d", report.LagSamples, lag)
+			}
+		})
+	}
+	rec := make([]float32, (48000+50000)*2)
+	copy(rec, ref)
+	copy(rec[100000:], ref)
+	if _, err := Analyze(audio.Canonical, ref, audio.Canonical, rec); err == nil {
+		t.Fatal("accepted duplicate peaks in different blocks")
 	}
 }

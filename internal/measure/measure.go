@@ -9,19 +9,22 @@ import (
 	"github.com/khenrix/home-sound/internal/audio"
 )
 
+// Report contains heuristic estimates only; it is not an acoustic acceptance or calibration.
 type Report struct {
-	ReferenceRate   int     `json:"reference_rate_hz"`
-	RecordingRate   int     `json:"recording_rate_hz"`
-	LagSamples      int     `json:"lag_samples"`
-	LagMS           float64 `json:"lag_ms"`
-	RelativeDB      float64 `json:"relative_level_db"`
-	NoiseDBFS       float64 `json:"residual_noise_dbfs"`
-	UncertaintyMS   float64 `json:"peak_uncertainty_ms"`
-	SNRDB           float64 `json:"snr_db"`
-	Confidence      float64 `json:"confidence"`
-	DriftPPM        float64 `json:"drift_ppm"`
-	ClippedFraction float64 `json:"clipped_fraction"`
-	AbsoluteSPL     string  `json:"absolute_spl"`
+	ReferenceRate                  int     `json:"reference_rate_hz"`
+	RecordingRate                  int     `json:"recording_rate_hz"`
+	LagSamples                     int     `json:"lag_samples"`
+	LagMS                          float64 `json:"lag_ms"`
+	RelativeDB                     float64 `json:"relative_level_db"`
+	NoiseDBFS                      float64 `json:"residual_noise_dbfs"`
+	PeakUncertaintyHeuristicMS     float64 `json:"peak_uncertainty_heuristic_ms"`
+	SNRDB                          float64 `json:"snr_db"`
+	CorrelationConfidenceHeuristic float64 `json:"correlation_confidence_heuristic"`
+	DriftPPM                       float64 `json:"drift_ppm"`
+	ClippedFraction                float64 `json:"clipped_fraction"`
+	AbsoluteSPL                    string  `json:"absolute_spl"`
+	Quality                        string  `json:"quality"`
+	CalibrationEligibility         string  `json:"calibration_eligibility"`
 }
 
 func Analyze(rf audio.Format, ref []float32, cf audio.Format, rec []float32) (Report, error) {
@@ -101,10 +104,12 @@ func Analyze(rf audio.Format, ref []float32, cf audio.Format, rec []float32) (Re
 	out.RelativeDB = 20 * math.Log10(gain)
 	out.SNRDB = snr
 	out.NoiseDBFS = 10 * math.Log10(residual/float64(len(a)))
-	out.UncertaintyMS = float64(max(first.radius, last.radius)) * 1000 / float64(rf.Rate)
-	out.Confidence = math.Min(first.score, last.score)
+	out.PeakUncertaintyHeuristicMS = float64(max(first.radius, last.radius)) * 1000 / float64(rf.Rate)
+	out.CorrelationConfidenceHeuristic = math.Min(first.score, last.score)
 	out.DriftPPM = drift
 	out.AbsoluteSPL = "unverified"
+	out.Quality = "heuristic"
+	out.CalibrationEligibility = "not_acoustically_verified"
 	return out, nil
 }
 
@@ -115,49 +120,60 @@ type peak struct {
 }
 
 func match(pattern, data []float64) (peak, error) {
+	const block = 32768
 	n := 1
-	for n < len(pattern)+len(data)-1 {
+	for n < block+2*len(pattern)-2 {
 		n *= 2
 	}
-	x := make([]complex128, n)
-	y := make([]complex128, n)
+	kernel := make([]complex128, n)
+	work := make([]complex128, n)
 	var power float64
 	for i, v := range pattern {
-		x[len(pattern)-1-i] = complex(v, 0)
+		kernel[len(pattern)-1-i] = complex(v, 0)
 		power += v * v
 	}
 	if power < 1e-8 {
 		return peak{}, errors.New("silent reference")
 	}
-	for i, v := range data {
-		y[i] = complex(v, 0)
-	}
-	fft(x, false)
-	fft(y, false)
-	for i := range x {
-		x[i] *= y[i]
-	}
-	fft(x, true)
-	sums := make([]float64, len(data)+1)
-	for i, v := range data {
-		sums[i+1] = sums[i] + v*v
-	}
+	fft(kernel, false)
+	count := len(data) - len(pattern) + 1
+	scores := make([]float32, count)
 	best := peak{pos: -1}
-	scores := make([]float64, len(data)-len(pattern)+1)
-	for i := range scores {
-		p := sums[i+len(pattern)] - sums[i]
-		if p > 1e-8 {
-			scores[i] = real(x[i+len(pattern)-1]) / math.Sqrt(power*p)
+	for start := 0; start < count; start += block {
+		positions := min(block, count-start)
+		input := positions + len(pattern) - 1
+		clear(work)
+		for i := 0; i < input; i++ {
+			work[i] = complex(data[start+i], 0)
 		}
-		if scores[i] > best.score {
-			best = peak{pos: i, score: scores[i]}
+		fft(work, false)
+		for i := range work {
+			work[i] *= kernel[i]
+		}
+		fft(work, true)
+		var sum float64
+		for _, v := range data[start : start+len(pattern)] {
+			sum += v * v
+		}
+		for i := 0; i < positions; i++ {
+			if i > 0 {
+				old := data[start+i-1]
+				next := data[start+i+len(pattern)-1]
+				sum += next*next - old*old
+			}
+			if sum > 1e-8 {
+				scores[start+i] = float32(real(work[i+len(pattern)-1]) / math.Sqrt(power*sum))
+			}
+			if float64(scores[start+i]) > best.score {
+				best = peak{pos: start + i, score: float64(scores[start+i])}
+			}
 		}
 	}
 	if best.pos < 0 || best.score < 0.9 {
 		return peak{}, errors.New("weak correlation")
 	}
 	for i, v := range scores {
-		if v > best.score*0.9 {
+		if float64(v) > best.score*0.9 {
 			distance := abs(i - best.pos)
 			if distance > 96 {
 				return peak{}, errors.New("ambiguous correlation peaks")

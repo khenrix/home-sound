@@ -75,14 +75,16 @@ func TestProbeAndAnalyzeCLI(t *testing.T) {
 		t.Fatal(err)
 	}
 	var report struct {
-		LagSamples  int     `json:"lag_samples"`
-		RelativeDB  float64 `json:"relative_level_db"`
-		AbsoluteSPL string  `json:"absolute_spl"`
+		LagSamples             int     `json:"lag_samples"`
+		RelativeDB             float64 `json:"relative_level_db"`
+		AbsoluteSPL            string  `json:"absolute_spl"`
+		Quality                string  `json:"quality"`
+		CalibrationEligibility string  `json:"calibration_eligibility"`
 	}
 	if err = json.Unmarshal(out.Bytes(), &report); err != nil {
 		t.Fatal(err)
 	}
-	if report.LagSamples != 480 || math.Abs(report.RelativeDB+6.0206) > 0.05 || report.AbsoluteSPL != "unverified" {
+	if report.LagSamples != 480 || math.Abs(report.RelativeDB+6.0206) > 0.05 || report.AbsoluteSPL != "unverified" || report.Quality != "heuristic" || report.CalibrationEligibility != "not_acoustically_verified" {
 		t.Fatalf("bad analysis: %+v", report)
 	}
 }
