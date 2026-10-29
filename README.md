@@ -1,6 +1,8 @@
 # Home Sound
 
-Home Sound is an early audio foundation for a planned multi-room system. The CLI generates reference WAVs, inspects files, records an explicit microphone session and analyzes a recording; it does not play audio or control devices. Real microphone capture, synchronization, and acoustic acceptance remain unverified.
+Home Sound is an early audio foundation for a planned multi-room system. The CLI generates reference WAVs, inspects files, records an explicit microphone session and analyzes a recording. It also provides bounded direct AirPlay proof commands, protected device pairing, native LG volume control and read-only discovery. Real hardware playback, microphone capture, synchronization and acoustic acceptance remain unverified.
+
+See [Direct AirPlay and LG native control](docs/airplay-native.md) for the pinned helper, protected setup, volume gates, explicit inventory and single-device proof commands.
 
 Requires Go 1.27.3.
 
