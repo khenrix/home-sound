@@ -85,4 +85,83 @@ For the speaker proof, explicitly select `-target speaker -volume 5` and its Air
 
 `airplay.New(Config)` returns a persistent `Adapter` implementing `Output`. `Prepare(ctx, epoch, firstSample)` opens one session and keeps `ctx` as its lifetime. `Write(ctx, audio.Frame)` accepts contiguous canonical frames for that epoch, bounded to one second each; it converts to little-endian PCM16. `Start(ctx, epoch, requestedTime)` waits for the matching helper acknowledgement. `Status()` exposes health, transport readiness, validated `ClockMode`/`ClockState`, `ClockMeasurementKnown`, `ClockReady`, sanitized `HelperErrorCode`/`HelperHTTPStatus`, submitted frame count and current anchor, including `ContentCutPending`. `ClockMeasurementKnown` is false for unmeasurable NTP and for PTP cold/stalled snapshots; it is true for validated PTP probing/ready snapshots. Transport `Ready` does not prove a measured receiver clock or sound. `Metadata` submits text, and `Stop` closes the session. An adapter represents one epoch and one START; create another adapter after Stop or for another epoch rather than retaining old queued PCM.
 
-`Config.ClockOffsetNS *int64` passes an explicit signed offset through `--clock-offset-ns`. When set, START timestamps and returned acknowledgement times are values in the helper's `CLOCK_MONOTONIC_RAW + offset` domain. The coordinator must provide that same clock domain; Task 3 does not establish a shared frozen mapping. The CLI readiness probe can pass the flag, but CLI playback rejects it because its scheduler uses wall time.
+`Config.ClockOffsetNS *int64` passes an explicit signed offset through `--clock-offset-ns`. When set, START timestamps and returned acknowledgement times are values in the helper's `CLOCK_MONOTONIC_RAW + offset` domain. The group coordinator provides one frozen mapping to every output and its owned daemon. The CLI readiness probe can accept an external offset; CLI playback rejects external offsets and creates its own frozen mapping for PTP.
+
+## Explicit transport routes
+
+The bus remains 48000 Hz stereo float32. Device configuration can specify
+`"transport":{"rate":44100,"timing":"ptp"}` for the observed Sonos route.
+Omitting transport keeps 48000/NTP. Supported rates are exactly 44100 and 48000;
+timing is explicitly `ntp` or `ptp`. Realtime native AP2 is enforced; advertised
+known format tables that exclude the requested format, malformed capabilities,
+buffered routes, or a different effective clock mode fail before PCM. Unknown
+format tables remain unknown and do not by themselves exclude the LG route.
+PTP requires measured `ready`; cold, probing, stalled and NTP fallback cannot
+release audio. NTP `cold` remains explicitly unmeasured.
+
+Bounded proof commands accept `-transport-rate 44100 -timing ptp`. Their input
+WAV must still be canonical 48000 Hz; the adapter performs the conversion.
+PTP CLI proofs freeze a raw-to-Unix mapping and use it for daemon, helper, START,
+and drain. User-supplied clock offsets remain status/coordinator-only; playback
+uses its own mapping. Generic startup remains 1–15; LG still requires verified
+native 10 before and after helper readiness, monitoring, and a ceiling of 15.
+
+PTP routes require an explicitly selected helper built with the ownership patch
+in `helpers/airplay/`. The unmodified release does not implement its strict
+private-endpoint arguments and therefore cannot silently substitute a standalone
+clock. NTP-only users can continue selecting the official pinned helper. No
+helper path or checksum is automatically replaced.
+
+## Owned PTP lifecycle
+
+On Linux, one process-wide manager leases one daemon to all active PTP outputs.
+Every lease must agree on helper path/hash and frozen clock offset. The daemon
+uses a random generation-specific `/hs-ptp-…` POSIX shared-memory name and an
+explicit ephemeral loopback UDP control port. The patched helper exclusively
+creates mode-0600 memory and exclusively binds its timing ports. It never
+reuses or removes an unknown object. A foreign timing-port owner causes startup
+failure. Multicast membership is retained; SO_REUSEADDR is removed because the
+actual Linux fixture demonstrated duplicate UDP binders with it enabled.
+
+Startup requires the owned child to remain alive, a validated control reply and
+a consistent published version-4 clock snapshot. Health checks every second
+have a one-second request deadline and require the publication sequence to
+advance. Death, hung control, stalled publication or malformed data cancels all
+dependent streams. Last release reaps only the owned daemon, using SIGTERM and
+a one-second kill bound. Linux parent-death signaling covers a controller crash.
+A hard-killed daemon may leave its private shared-memory object; the next
+generation uses a different name, and unknown orphan objects are left intact.
+The Go manager currently rejects non-Linux hosts explicitly.
+
+`Status.Transport`, `RouteVerified`, `CapabilitiesVerified`, `SharedPTP` and
+`PTPDaemonHealthy` describe transport evidence. They do not certify audibility
+or acoustic synchronization. The shared daemon and 44.1 kHz route still need
+controller-led multi-device hardware validation.
+
+## Rational resampling and EOF
+
+`internal/resample.New(inRate, outRate, channels)` supplies a reusable stateful
+256-tap polyphase Blackman-windowed sinc FIR for 44100/48000 Hz and one or two
+channels. `Process`, `Finish` and `Reset` preserve integer rational phase across
+chunks. Calls accept at most 48000 input frames, retain bounded history, reject
+nonfinite data and reject output overflow. The filter cutoff is 0.46 times the
+lower sample rate. Tests measure 18 kHz gain within 1%, 48→44.1 rejection at
+23 kHz below −80 dB, and 44.1→48 rejection at 21.8 kHz below −60 dB; these are
+specific tested frequencies, not an acoustic measurement.
+
+The symmetric FIR buffers 128 future input samples: 2.667 ms at 48 kHz or
+2.903 ms at 44.1 kHz. Output sample zero represents input time zero. Boundaries
+are zero extended. Finish emits exactly ceil(inputFrames × outRate / inRate)
+frames overall and crops the filter tail to that duration. It adds no hidden
+room offset. The adapter's optional `Finish(context.Context) error` drains the
+lookahead without closing persistent stdin. Session EOF invokes it after the
+last canonical frame; explicit EOF-tail replay creates and finishes a fresh
+converter. Stop/flush/quarantine behavior remains in force.
+
+`Status.Frames` and `Anchor.Sample` remain canonical. Helper content-cut bytes
+are converted from actual transport frames to canonical frames, rounding upward;
+`Anchor.SampleUncertaintyNS` accumulates the resulting bound. EOF duration is
+rounded upward to a transport frame and reported as `DurationPaddingNS`. Session
+drain includes both bounds. For example, seven 44.1 kHz frames become eight
+canonical frames with 7937 ns uncertainty; 961 canonical input frames produce
+883 transport frames with 1843 ns extra duration.

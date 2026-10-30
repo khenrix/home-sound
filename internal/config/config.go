@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/khenrix/home-sound/internal/airplay"
 	"github.com/khenrix/home-sound/internal/pairing"
 	"github.com/khenrix/home-sound/internal/volume"
 )
@@ -18,15 +19,16 @@ const TVAndSpeakers = "TV + All Speakers"
 const AllSpeakers = "All Speakers"
 
 type Device struct {
-	Kind              string  `json:"kind"`
-	Adapter           string  `json:"adapter"`
-	Host              string  `json:"host,omitempty"`
-	Port              int     `json:"port,omitempty"`
-	PairingFile       string  `json:"pairing_file,omitempty"`
-	LGURL             string  `json:"lg_url,omitempty"`
-	LGPairingFile     string  `json:"lg_pairing_file,omitempty"`
-	CertificateSHA256 string  `json:"certificate_sha256,omitempty"`
-	RoomTrimDB        float64 `json:"room_trim_db"`
+	Transport         airplay.Transport `json:"transport,omitempty"`
+	Kind              string            `json:"kind"`
+	Adapter           string            `json:"adapter"`
+	Host              string            `json:"host,omitempty"`
+	Port              int               `json:"port,omitempty"`
+	PairingFile       string            `json:"pairing_file,omitempty"`
+	LGURL             string            `json:"lg_url,omitempty"`
+	LGPairingFile     string            `json:"lg_pairing_file,omitempty"`
+	CertificateSHA256 string            `json:"certificate_sha256,omitempty"`
+	RoomTrimDB        float64           `json:"room_trim_db"`
 }
 type Config struct {
 	Version            int                       `json:"version"`
@@ -77,6 +79,13 @@ func (c Config) Validate() error {
 		return errors.New("exactly one TV required")
 	}
 	for id, d := range c.Devices {
+		if d.Adapter == "airplay" {
+			if _, err := d.Transport.Normalize(); err != nil {
+				return err
+			}
+		} else if d.Transport != (airplay.Transport{}) {
+			return errors.New("transport route is only supported for AirPlay")
+		}
 		if d.Adapter != "airplay" && d.Adapter != "sendspin" {
 			return errors.New("unsupported configured adapter")
 		}
@@ -91,6 +100,9 @@ func (c Config) Validate() error {
 		if p, ok := c.Profiles[id]; ok {
 			if e := p.Validate(); e != nil {
 				return e
+			}
+			if p.Verified && d.Adapter == "airplay" && p.Provenance.Transport != d.Transport.Fingerprint(c.HelperSHA256) {
+				return errors.New("profile transport provenance mismatch; new measurement required")
 			}
 			if p.Verified && (p.Provenance.Adapter != d.Adapter || p.Provenance.Format != "48000/stereo/pcm16" || p.Provenance.NativeControl != nativeControl(d)) {
 				return errors.New("profile transport/native-control fingerprint mismatch")

@@ -53,6 +53,12 @@ func TestCLIHelperProcess(t *testing.T) {
 		os.Exit(2)
 	}
 	defer f.Close()
+	mask := "0x100000"
+	if get("--samplerate") == "44100" {
+		mask = "0x40000"
+	}
+	fmt.Fprintln(os.Stderr, "[STATUS] route protocol=airplay2 flow=native timing=ntp buffered=0")
+	fmt.Fprintf(os.Stderr, "[STATUS] capabilities requested=%s realtime_formats=0x0 realtime_known=0 buffered_formats=0x0 buffered_known=0\n", mask)
 	fmt.Fprintln(os.Stderr, "[STATUS] connected\n[STATUS] clock_ready mode=ntp state=cold streak_ms=0 exchanges=0 ready_in_ms=0 ready_at_unix_ms=0")
 	go io.Copy(io.Discard, os.Stdin)
 	s := bufio.NewScanner(f)
@@ -86,7 +92,7 @@ func TestBoundedSpeakerProofCommand(t *testing.T) {
 	wave.Write(f, audio.Canonical, make([]float32, 960))
 	f.Close()
 	var out, errs bytes.Buffer
-	e = run([]string{"play", "-helper", helper, "-helper-sha256", hex.EncodeToString(sum[:]), "-host", "127.0.0.1", "-target", "speaker", "-volume", "5", "-input", input, "-duration", "10ms"}, &out, &errs)
+	e = run([]string{"play", "-transport-rate", "44100", "-timing", "ntp", "-helper", helper, "-helper-sha256", hex.EncodeToString(sum[:]), "-host", "127.0.0.1", "-target", "speaker", "-volume", "5", "-input", input, "-duration", "10ms"}, &out, &errs)
 	if e != nil {
 		t.Fatal(e)
 	}

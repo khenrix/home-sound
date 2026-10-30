@@ -170,7 +170,8 @@ func (s *running) drain(end uint64) {
 		}
 		s.mu.Unlock()
 		for _, o := range outputs {
-			a := o.Status().Anchor
+			status := o.Status()
+			a := status.Anchor
 			if a.At.IsZero() || a.Sample > end {
 				continue
 			}
@@ -178,7 +179,7 @@ func (s *running) drain(end uint64) {
 			if err != nil {
 				continue
 			}
-			actual := time.Duration(a.At.UnixNano()-s.engine.offset) + length
+			actual := time.Duration(a.At.UnixNano()-s.engine.offset) + length + time.Duration(a.SampleUncertaintyNS) + time.Duration(status.DurationPaddingNS)
 			if actual > until {
 				until = actual
 			}

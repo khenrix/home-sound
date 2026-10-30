@@ -32,7 +32,7 @@ Zero trims in this preview mean no correction has been applied; they are not mea
 
 Real AirPlay configuration additionally supplies `helper`, `helper_sha256`, per-device `host`, `port`, and optional `pairing_file`. A TV also supplies `lg_url`, `lg_pairing_file`, and optional `certificate_sha256`; the native and AirPlay host must match. See `airplay-native.md` for the existing protected pairing process. Pairing never happens automatically in the group service.
 
-A profile is `volume.Profile`: `version`, `verified`, `points` (`native`, `db`), optional declared `native_maximum`, and `provenance` (`adapter`, `format`, `sensor`, `native_control`, `reference`). Empty version-1 profiles are allowed only as unverified placeholders. Measured points must be finite and strictly increasing in native step and relative dB. A verified profile's adapter/format/native-control fingerprint must match its configured device (`48000/stereo/pcm16`, and `webos` for the TV). Provenance is operator-supplied evidence, not an automatic acoustic certification.
+A profile is `volume.Profile`: `version`, `verified`, `points` (`native`, `db`), optional declared `native_maximum`, and `provenance` (`adapter`, `format`, `transport`, `sensor`, `native_control`, `reference`). Empty version-1 profiles are allowed only as unverified placeholders. Measured points must be finite and strictly increasing in native step and relative dB. A verified profile's adapter/format/native-control fingerprint must match its configured device (`48000/stereo/pcm16`, and `webos` for the TV). Provenance is operator-supplied evidence, not an automatic acoustic certification.
 
 For calibrated playback, every selected member needs a verified profile and configuration needs a verified `reference_ceiling_db`. The target plus the member's separate room trim is inverted to a measured native step at or above it, with nonpositive digital attenuation. Above the measured top, a member saturates only when that top is also its declared native maximum; otherwise playback is rejected as calibration-limited. Returning below a native maximum resumes tracking. Native feedback interpolates only inside the measured reference span, never outside it. Own acknowledgements and duplicates are suppressed. A native-step change stops and flushes that member before preparing a fresh adapter with the new gain, rejoining the unchanged canonical timeline. This can leave a preparation gap; it does not seek or pause the source. Remote TV observations also trigger this reconciliation when the mapped native step is unchanged. An observation outside the verified ceiling/range restores the last authorized plan and records `native_change_rejected`. Status retains `last_remote_native` as the last unsuppressed observation, not current native readback. Acknowledgements belong to one adapter attempt. If teardown fails, that member stops with `stop_failed` and the engine quarantines the receiver. `quarantined_devices` remains visible after stop, recast, seek and profile/config replacement. Identity includes the configured ID and normalized physical host, so renaming a device or changing its service port cannot clear unresolved teardown. A new selection retries Stop on the original failed output and is rejected unless that operation succeeds; it never treats a fresh generation as teardown evidence. Other receivers remain selectable. There is no force-clear control.
 
@@ -87,3 +87,29 @@ Linux `CLOCK_MONOTONIC_RAW` supplies elapsed time. `session.Freeze` captures one
 The entire source read and normalized frame end stay at most three seconds ahead. Each member queue is at most 150 20-ms chunks (three seconds). Shared replay is at most four seconds, retaining the send-ahead and a frame spanning pause; bounded normalization/in-flight frames are separate (at most two 20-ms frames). Slow members overflow/cancel independently; output writes never block the source dispatcher. Retries use 1/2/4/8/15-second backoff, at most a 120-second failure episode, with 20-second preparation/initial-START bounds. Thirty seconds of sustained transport starts a fresh failure episode on a later loss. EOF, stop, exclusion and intentional transport controls cancel pending recovery. There is no goroutine per audio frame or retry backlog.
 
 Requested and acknowledged anchors remain distinct. Corrected times and actual content-cut samples are retained from the adapter; drain completion re-evaluates acknowledged anchors. NTP transport readiness does not become clock measurement, synchronization or verified audibility. Real acoustic gates, receiver timing corrections and native control behavior still need measurement before household profiles can be marked verified.
+
+## Transport provenance and converter completion
+
+AirPlay devices accept an optional `transport` object with `rate` (44100 or
+48000) and `timing` (`ntp` or `ptp`). Defaults remain 48000/NTP. Set Sonos outputs
+explicitly to 44100/PTP; this is a transport selection, not a measured room
+profile. `AirPlayFactory` passes the selection and the session's existing frozen
+clock offset unchanged. See `airplay-native.md` for owned-daemon and FIR limits.
+
+Verified AirPlay profiles now also require `provenance.transport`, the exact
+`airplay.Transport.Fingerprint(helperSHA256)` string. It records native realtime
+AP2, wire rate/channels/PCM depth, required timing, converter version and helper
+hash. `provenance.format` continues to describe the canonical source format.
+An old profile without transport provenance, or a changed rate, timing, filter
+version or helper hash, is rejected and requires fresh measurement. Do not copy
+an old curve and label it verified merely to satisfy the schema. Unverified
+previews still work without contacting devices.
+
+Outputs may optionally implement `Finish(context.Context) error`. The member
+calls it once after consuming the final canonical frame, including the last
+partial frame, and keeps the receiver alive through the acknowledged drain
+horizon. Cancellation must interrupt Finish. A failed finish records
+`finish_failed` and invokes ordinary Stop; failed receiver teardown still takes
+precedence and quarantines the receiver. Intentional native-volume changes after
+EOF retain and replay the source tail through a fresh converter. Existing source
+and mandatory output interfaces are unchanged.

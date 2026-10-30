@@ -11,6 +11,7 @@ type Point struct {
 	DB     float64 `json:"db"`
 }
 type Provenance struct {
+	Transport     string `json:"transport,omitempty"`
 	Adapter       string `json:"adapter"`
 	Format        string `json:"format"`
 	Sensor        string `json:"sensor"`

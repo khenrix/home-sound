@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"github.com/khenrix/home-sound/internal/airplay"
 	"github.com/khenrix/home-sound/internal/volume"
 	"os"
 	"path/filepath"
@@ -93,4 +94,35 @@ func TestStorageRefusesSymlinkAndPublicDirectory(t *testing.T) {
 	if string(b) != "preserve" {
 		t.Fatal("symlink target changed")
 	}
+}
+
+func TestTransportFingerprintRejectsLegacyAndChangedRoutes(t *testing.T) {
+	c := fixture()
+	c.HelperSHA256 = "fixture-helper-sha"
+	p := volume.Profile{Version: 1, Verified: true, Points: []volume.Point{{Native: 1, DB: -40}, {Native: 2, DB: -35}}, Provenance: volume.Provenance{Adapter: "airplay", Format: "48000/stereo/pcm16", Sensor: "synthetic", NativeControl: "airplay", Reference: "synthetic-only"}}
+	c.Profiles["kitchen"] = p
+	if c.Validate() == nil {
+		t.Fatal("legacy profile lacks actual transport provenance")
+	}
+	p.Provenance.Transport = "airplay2/native/realtime/48000/stereo/pcm16/ntp/identity/fixture-helper-sha"
+	c.Profiles["kitchen"] = p
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, route := range []airplay.Transport{{Rate: 44100, Timing: "ntp"}, {Rate: 48000, Timing: "ptp"}, {Rate: 32000, Timing: "ntp"}, {Rate: 48000, Timing: "auto"}} {
+		d := c.Devices["kitchen"]
+		d.Transport = route
+		c.Devices["kitchen"] = d
+		if c.Validate() == nil {
+			t.Fatalf("accepted incompatible route %+v", route)
+		}
+	}
+	d := c.Devices["kitchen"]
+	d.Transport = airplay.Transport{}
+	c.Devices["kitchen"] = d
+	c.HelperSHA256 = "other-helper"
+	if c.Validate() == nil {
+		t.Fatal("changed helper retained calibration")
+	}
+
 }

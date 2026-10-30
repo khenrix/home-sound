@@ -83,6 +83,15 @@ func (o *nativeOutput) Write(ctx context.Context, f audio.Frame) error {
 	}
 	return o.Output.Write(ctx, f)
 }
+func (o *nativeOutput) Finish(ctx context.Context) error {
+	if !o.audioAllowed {
+		return errors.New("native control must succeed before audio")
+	}
+	if f, ok := o.Output.(interface{ Finish(context.Context) error }); ok {
+		return f.Finish(ctx)
+	}
+	return nil
+}
 func (o *nativeOutput) Stop() error {
 	err := o.Output.Stop()
 	if o.closeNative != nil {
@@ -100,7 +109,7 @@ func AirPlayFactory(cfg config.Config) Factory {
 		if r.Device.Adapter != "airplay" {
 			return nil, ErrUnsupportedOutput
 		}
-		c := airplay.Config{Helper: cfg.Helper, HelperSHA256: cfg.HelperSHA256, Host: r.Device.Host, Port: r.Device.Port, PairingFile: r.Device.PairingFile, InitialVolume: 1, ClockOffsetNS: &r.ClockOffsetNS}
+		c := airplay.Config{Helper: cfg.Helper, HelperSHA256: cfg.HelperSHA256, Transport: r.Device.Transport, Host: r.Device.Host, Port: r.Device.Port, PairingFile: r.Device.PairingFile, InitialVolume: 1, ClockOffsetNS: &r.ClockOffsetNS}
 		var client *webos.Client
 		if r.Device.Kind == "tv" {
 			u, err := url.Parse(r.Device.LGURL)

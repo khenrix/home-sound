@@ -251,10 +251,32 @@ func (s *running) attempt(m *member, first uint64, deadline time.Duration, resum
 	m.queue = q
 	s.mu.Unlock()
 	next := first
+	finished := false
 	for {
+		s.mu.Lock()
+		atEOF := s.sourceState == "ended" && next == s.next
+		changed := s.changed
+		s.mu.Unlock()
+		if atEOF && !finished {
+			if finisher, ok := out.(interface{ Finish(context.Context) error }); ok {
+				if finishErr := finisher.Finish(ctx); finishErr != nil {
+					if ctx.Err() == nil {
+						s.mu.Lock()
+						m.state.Errors++
+						m.state.LastError = "finish_failed"
+						s.eventLocked(m.id, "finish_failed")
+						s.mu.Unlock()
+					}
+					return finishErr, started, preparedIn
+				}
+			}
+			finished = true
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err(), started, preparedIn
+		case <-changed:
+			continue
 		case <-m.wake:
 			s.mu.Lock()
 			desired := m.plan

@@ -37,6 +37,16 @@ func TestHelperProcess(t *testing.T) {
 		}
 		return ""
 	}
+	if get("--ptp-daemon") != "" {
+		if mode == "ptp_fail" {
+			os.Exit(45)
+		}
+		runPTPFixture(get)
+		os.Exit(0)
+	}
+	if mode == "ptp_stream" && (get("--ptp-shared-required") == "" || get("--ptp-shm-name") == "" || get("--ptp-control-port") == "") {
+		os.Exit(44)
+	}
 	if mode == "pair" || mode == "pairfail" {
 		bufio.NewReader(os.Stdin).ReadString('\n')
 		if mode == "pairfail" {
@@ -92,11 +102,14 @@ func TestHelperProcess(t *testing.T) {
 		}
 		os.WriteFile(p, []byte("connected"), 0600)
 	}
-	if mode == "ntp_cold" {
-		fmt.Println("[STATUS] route protocol=airplay2 flow=native timing=ntp buffered=0")
-		fmt.Println("[STATUS] latency lead_ms=2000 device_min_frames=0 device_max_frames=0 device_render_ms=0 warm_lead_ms=0")
-		fmt.Println("[STATUS] capabilities requested=0x0 realtime_formats=0x0 realtime_known=0 buffered_formats=0x0 buffered_known=0")
+	fmt.Printf("[STATUS] route protocol=airplay2 flow=native timing=%s buffered=0\n", get("--timing"))
+	rate := get("--samplerate")
+	mask := "0x100000"
+	if rate == "44100" {
+		mask = "0x40000"
 	}
+	fmt.Printf("[STATUS] capabilities requested=%s realtime_formats=0x0 realtime_known=0 buffered_formats=0x0 buffered_known=0\n", mask)
+
 	fmt.Fprintln(os.Stderr, "[STATUS] connected")
 	switch mode {
 	case "cold":
@@ -119,9 +132,19 @@ func TestHelperProcess(t *testing.T) {
 	case "ptp_stalled":
 		fmt.Fprintln(os.Stderr, "[STATUS] clock_ready mode=ptp state=stalled streak_ms=0 exchanges=0 ready_in_ms=0 ready_at_unix_ms=0")
 	default:
-		fmt.Fprintln(os.Stderr, "[STATUS] clock_ready mode=ptp state=ready streak_ms=1000000 exchanges=8 ready_in_ms=0 ready_at_unix_ms=1001000")
+		if get("--timing") == "ptp" {
+			fmt.Fprintln(os.Stderr, "[STATUS] clock_ready mode=ptp state=ready streak_ms=10000 exchanges=18 ready_in_ms=0 ready_at_unix_ms=1001000")
+		} else {
+			fmt.Fprintln(os.Stderr, "[STATUS] clock_ready mode=ntp state=cold streak_ms=0 exchanges=0 ready_in_ms=0 ready_at_unix_ms=0")
+		}
 	}
-	if mode != "blocked" && mode != "pcm" {
+	if strings.HasPrefix(mode, "resample") {
+		if get("--samplerate") != "44100" || get("--timing") != "ntp" || os.Getenv("CLIAIRPLAY_BUFFERED") != "0" {
+			os.Exit(30)
+		}
+
+	}
+	if mode != "blocked" && mode != "pcm" && !strings.HasPrefix(mode, "resample") {
 		go io.Copy(io.Discard, os.Stdin)
 	}
 	if mode == "blockedcommands" {
@@ -152,6 +175,15 @@ func TestHelperProcess(t *testing.T) {
 			}
 			os.WriteFile(os.Getenv("HOME_SOUND_ORDER_PATH")+".stopped", []byte("stopped"), 0600)
 			os.Exit(0)
+		}
+		if strings.HasPrefix(mode, "resample") && line == "ACTION=SENDMETA" {
+			syscall.SetNonblock(0, true)
+			reader := os.NewFile(0, "fixture PCM")
+			if reader.SetReadDeadline(time.Now().Add(30*time.Millisecond)) != nil {
+				os.Exit(31)
+			}
+			raw, _ := io.ReadAll(reader)
+			os.WriteFile(os.Getenv("HOME_SOUND_ORDER_PATH")+".pcm", raw, 0600)
 		}
 		if mode == "pcm" {
 			if strings.HasPrefix(line, "TITLE=") || strings.HasPrefix(line, "ARTIST=") || strings.HasPrefix(line, "ALBUM=") {

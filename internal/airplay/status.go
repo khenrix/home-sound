@@ -40,6 +40,10 @@ func (a *Adapter) consume(line string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	switch f[1] {
+	case "route":
+		a.routeLocked(fields)
+	case "capabilities":
+		a.capabilitiesLocked(fields)
 	case "connected":
 		a.status.Connected = true
 	case "clock_ready":
@@ -48,7 +52,7 @@ func (a *Adapter) consume(line string) {
 		a.status.ClockState = report.state
 		a.status.ClockMeasurementKnown = report.measured
 		a.status.ClockReady = report.ready
-		if !ok {
+		if !ok || a.cfg.Transport.Timing != "" && report.mode != a.cfg.Transport.Timing || a.status.Ready && report.mode == "ptp" && !report.ready {
 			a.status.Healthy = false
 			a.status.Ready = false
 			if a.cancel != nil {
@@ -75,10 +79,16 @@ func (a *Adapter) consume(line string) {
 	case "content_cut":
 		requested, ok := number("requested_ms")
 		cutBytes, okBytes := number("cut_bytes")
-		if !ok || !okBytes || !a.status.Anchor.ContentCutPending || requested != a.cutRequested || cutBytes%4 != 0 || uint64(cutBytes/4) > math.MaxUint64-a.status.Anchor.Sample {
+		if !ok || !okBytes || !a.status.Anchor.ContentCutPending || requested != a.cutRequested || cutBytes%4 != 0 {
 			return
 		}
-		a.status.Anchor.Sample += uint64(cutBytes / 4)
+		cut, uncertainty, valid := canonicalCut(uint64(cutBytes/4), a.cfg.Transport.Rate)
+		if !valid || cut > math.MaxUint64-a.status.Anchor.Sample || uncertainty > math.MaxUint64-a.status.Anchor.SampleUncertaintyNS {
+			a.rejectLocked()
+			return
+		}
+		a.status.Anchor.Sample += cut
+		a.status.Anchor.SampleUncertaintyNS += uncertainty
 		a.status.Anchor.ContentCutPending = false
 	case "error", "stopped", "eof":
 		if f[1] == "stopped" {

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/khenrix/home-sound/internal/audio"
+	"github.com/khenrix/home-sound/internal/resample"
 	"github.com/khenrix/home-sound/internal/webos"
 )
 
@@ -35,16 +36,20 @@ type Config struct {
 	Port, InitialVolume                     int
 	ClockOffsetNS                           *int64
 	LG                                      NativeVolume
+	Transport                               Transport
 }
 type Anchor struct {
 	Epoch, Sample                uint64
 	Requested, At                time.Time
 	Corrected, ContentCutPending bool
+	SampleUncertaintyNS          uint64
 }
 
 // Status separates transport readiness from receiver clock measurement.
 // NTP can be Ready while ClockReady and ClockMeasurementKnown remain false.
 type Status struct {
+	DurationPaddingNS                     uint64
+	SharedPTP, PTPDaemonHealthy           bool
 	Healthy, Connected, ClockReady, Ready bool
 	ClockMode, ClockState                 string
 	ClockMeasurementKnown                 bool
@@ -52,6 +57,8 @@ type Status struct {
 	HelperHTTPStatus                      int
 	Anchor                                Anchor
 	Frames                                uint64
+	Transport                             Transport
+	RouteVerified, CapabilitiesVerified   bool
 }
 type Metadata struct{ Title, Artist, Album string }
 type Output interface {
@@ -63,6 +70,9 @@ type Output interface {
 	Metadata(context.Context, Metadata) error
 }
 type Adapter struct {
+	lease              *ptpLease
+	converter          *resample.Converter
+	finished           bool
 	cfg                Config
 	op                 sync.Mutex
 	mu                 sync.Mutex
@@ -83,6 +93,14 @@ type Adapter struct {
 }
 
 func New(cfg Config) (*Adapter, error) {
+	var err error
+	cfg.Transport, err = cfg.Transport.Normalize()
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Transport.Timing == "ptp" && cfg.ClockOffsetNS == nil {
+		return nil, errors.New("PTP requires frozen host-clock mapping")
+	}
 	if !filepath.IsAbs(cfg.Helper) || net.ParseIP(cfg.Host).To4() == nil || cfg.Port < 1 || cfg.Port > 65535 {
 		return nil, errors.New("absolute helper path, IPv4 address and port required")
 	}
@@ -100,7 +118,14 @@ func New(cfg Config) (*Adapter, error) {
 		offset := *cfg.ClockOffsetNS
 		cfg.ClockOffsetNS = &offset
 	}
-	return &Adapter{cfg: cfg, changed: make(chan struct{})}, nil
+	a := &Adapter{cfg: cfg, status: Status{Transport: cfg.Transport}, changed: make(chan struct{})}
+	if cfg.Transport.Rate != 48000 {
+		a.converter, err = resample.New(48000, cfg.Transport.Rate, 2)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return a, nil
 }
 func verifyHelper(path, checksum string) error {
 	want, e := hex.DecodeString(checksum)
@@ -118,8 +143,16 @@ func verifyHelper(path, checksum string) error {
 	}
 	return nil
 }
-func (a *Adapter) signalLocked()  { close(a.changed); a.changed = make(chan struct{}) }
-func (a *Adapter) Status() Status { a.mu.Lock(); defer a.mu.Unlock(); return a.status }
+func (a *Adapter) signalLocked() { close(a.changed); a.changed = make(chan struct{}) }
+func (a *Adapter) Status() Status {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	status := a.status
+	if a.lease != nil {
+		status.PTPDaemonHealthy = a.lease.daemon.healthy.Load()
+	}
+	return status
+}
 func (a *Adapter) fail() {
 	a.mu.Lock()
 	a.stopped = true
@@ -185,6 +218,9 @@ func (a *Adapter) Prepare(ctx context.Context, epoch, first uint64) (resultErr e
 		if resultErr != nil {
 			a.fail()
 			cancel()
+			if a.lease != nil && a.done == nil {
+				a.lease.release()
+			}
 		}
 	}()
 	a.cancel = cancel
@@ -201,9 +237,31 @@ func (a *Adapter) Prepare(ctx context.Context, epoch, first uint64) (resultErr e
 		cancel()
 		return err
 	}
-	args := []string{"--protocol", "airplay2", "--ap2-native", "--port", strconv.Itoa(a.cfg.Port), "--volume", strconv.Itoa(a.cfg.InitialVolume), "--samplerate", "48000", "--bitdepth", "16", "--channels", "2", "--debug", "0"}
+	args := []string{"--protocol", "airplay2", "--ap2-native", "--port", strconv.Itoa(a.cfg.Port), "--volume", strconv.Itoa(a.cfg.InitialVolume), "--samplerate", strconv.Itoa(a.cfg.Transport.Rate), "--timing", a.cfg.Transport.Timing, "--bitdepth", "16", "--channels", "2", "--debug", "0"}
 	if a.cfg.ClockOffsetNS != nil {
 		args = append(args, "--clock-offset-ns", strconv.FormatInt(*a.cfg.ClockOffsetNS, 10))
+	}
+	if a.cfg.Transport.Timing == "ptp" {
+		lease, err := sharedPTP.acquire(childCtx, a.cfg)
+		if err != nil {
+			return err
+		}
+		a.mu.Lock()
+		a.lease = lease
+		a.status.SharedPTP = true
+		a.status.PTPDaemonHealthy = true
+		a.mu.Unlock()
+		args = append(args, "--ptp-shared-required", "--ptp-shm-name", lease.daemon.name, "--ptp-control-port", strconv.Itoa(lease.daemon.port))
+		go func() {
+			select {
+			case <-childCtx.Done():
+			case <-lease.failed():
+				a.mu.Lock()
+				a.status.PTPDaemonHealthy = false
+				a.mu.Unlock()
+				a.fail()
+			}
+		}()
 	}
 	if a.cfg.PairingFile != "" {
 		p, e := loadCredentials(a.cfg.PairingFile, a.cfg.Host, a.cfg.Port)
@@ -230,6 +288,7 @@ func (a *Adapter) Prepare(ctx context.Context, epoch, first uint64) (resultErr e
 	cmd := exec.CommandContext(childCtx, a.cfg.Helper, append(args, "--cmdpipe", fifo, a.cfg.Host)...)
 	cmd.Cancel = func() error { return a.cancelHelper(cmd, commands) }
 	cmd.WaitDelay = 2 * time.Second
+	cmd.Env = append(os.Environ(), "CLIAIRPLAY_BUFFERED=0")
 	inputR, inputW, e := os.Pipe()
 	if e != nil {
 		commands.Close()
@@ -284,9 +343,18 @@ func (a *Adapter) Prepare(ctx context.Context, epoch, first uint64) (resultErr e
 		inputW.Close()
 		commands.Close()
 		os.RemoveAll(dir)
+		if a.lease != nil {
+			if err := a.lease.release(); err != nil {
+				a.mu.Lock()
+				a.stopErr = err
+				a.mu.Unlock()
+			}
+		}
 		close(done)
 	}()
-	if e = a.wait(ctx, func(s Status) bool { return s.Connected && clockAllowsStart(s) }); e != nil {
+	if e = a.wait(ctx, func(s Status) bool {
+		return s.Connected && s.RouteVerified && s.CapabilitiesVerified && clockAllowsStart(s)
+	}); e != nil {
 		a.fail()
 		return e
 	}
@@ -394,7 +462,7 @@ func (a *Adapter) Write(ctx context.Context, f audio.Frame) error {
 	defer a.op.Unlock()
 	a.mu.Lock()
 	s := a.status
-	valid := s.Ready && s.Healthy && f.Epoch == a.epoch && f.Sample == a.next
+	valid := s.Ready && s.Healthy && !a.finished && f.Epoch == a.epoch && f.Sample == a.next
 	input := a.input
 	if valid && len(f.Data) > 0 {
 		// A partial pipe write can reach the receiver even when Write fails.
@@ -404,8 +472,17 @@ func (a *Adapter) Write(ctx context.Context, f audio.Frame) error {
 	if !valid {
 		return errors.New("output not ready or stale/noncontiguous frame")
 	}
-	raw := make([]byte, len(f.Data)*2)
-	for i, v := range f.Data {
+	data := f.Data
+	if a.converter != nil {
+		var err error
+		data, err = a.converter.Process(data)
+		if err != nil {
+			a.fail()
+			return err
+		}
+	}
+	raw := make([]byte, len(data)*2)
+	for i, v := range data {
 		q, _ := audio.PCM16(v)
 		binary.LittleEndian.PutUint16(raw[i*2:], uint16(q))
 	}

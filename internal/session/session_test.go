@@ -199,7 +199,7 @@ func (f *sinks) count(id string) int { f.mu.Lock(); defer f.mu.Unlock(); return 
 func testConfig() config.Config {
 	max := 15
 	ceiling := -18.
-	p := volume.Profile{Version: 1, Verified: true, Provenance: volume.Provenance{Adapter: "airplay", Format: "48000/stereo/pcm16", Sensor: "fixture", NativeControl: "airplay", Reference: "synthetic-only"}, Points: []volume.Point{{Native: 10, DB: -30}, {Native: 12, DB: -24}, {Native: 15, DB: -18}}, NativeMaximum: &max}
+	p := volume.Profile{Version: 1, Verified: true, Provenance: volume.Provenance{Transport: "airplay2/native/realtime/48000/stereo/pcm16/ntp/identity/", Adapter: "airplay", Format: "48000/stereo/pcm16", Sensor: "fixture", NativeControl: "airplay", Reference: "synthetic-only"}, Points: []volume.Point{{Native: 10, DB: -30}, {Native: 12, DB: -24}, {Native: 15, DB: -18}}, NativeMaximum: &max}
 	c := config.Config{Version: 1, Groups: map[string][]string{config.TVAndSpeakers: {"tv", "kitchen", "roam", "hall"}, config.AllSpeakers: {"kitchen", "roam", "hall"}}, Devices: map[string]config.Device{}, Profiles: map[string]volume.Profile{}, ReferenceVerified: true, ReferenceCeilingDB: &ceiling}
 	for _, id := range []string{"tv", "kitchen", "roam", "hall"} {
 		kind := "speaker"

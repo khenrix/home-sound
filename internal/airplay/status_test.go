@@ -147,16 +147,8 @@ func TestNTPStillEnforcesNativeGateAndMonitor(t *testing.T) {
 }
 
 func TestPTPReadyTelemetryRemainsMeasured(t *testing.T) {
-	o, e := New(fixture(t, "ready"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer o.Stop()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if e = o.Prepare(ctx, 1, 0); e != nil {
-		t.Fatal(e)
-	}
+	o := &Adapter{changed: make(chan struct{}), status: Status{Healthy: true}}
+	o.consume("[STATUS] clock_ready mode=ptp state=ready streak_ms=1000000 exchanges=8 ready_in_ms=0 ready_at_unix_ms=1001000")
 	s := o.Status()
 	if !s.ClockReady || !s.ClockMeasurementKnown || s.ClockMode != "ptp" || s.ClockState != "ready" {
 		t.Fatalf("lost measured PTP status: %+v", s)

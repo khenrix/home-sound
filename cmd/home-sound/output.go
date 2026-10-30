@@ -17,6 +17,7 @@ import (
 	"github.com/khenrix/home-sound/internal/airplay"
 	"github.com/khenrix/home-sound/internal/audio"
 	"github.com/khenrix/home-sound/internal/discovery"
+	"github.com/khenrix/home-sound/internal/session"
 	"github.com/khenrix/home-sound/internal/wave"
 	"github.com/khenrix/home-sound/internal/webos"
 )
@@ -98,6 +99,8 @@ func runAirPlay(ctx context.Context, args []string, out, errOut io.Writer) error
 	checksum := f.String("helper-sha256", "", "expected helper SHA256")
 	host := f.String("host", "", "AirPlay IPv4 address")
 	port := f.Int("port", 7000, "AirPlay port")
+	rate := f.Int("transport-rate", 48000, "AirPlay wire sample rate: 44100 or 48000")
+	timing := f.String("timing", "ntp", "AirPlay clock: ntp or required shared ptp")
 	pairFile := f.String("pairing-file", "", "protected AirPlay pairing file")
 	target := f.String("target", "lg", "lg or speaker")
 	volume := f.Int("volume", 10, "LG must be 10; speaker initial AirPlay level 1 through 15")
@@ -114,7 +117,10 @@ func runAirPlay(ctx context.Context, args []string, out, errOut io.Writer) error
 	if f.NArg() != 0 || *duration <= 0 || *duration > 30*time.Second {
 		return errors.New("proof duration must be in (0, 30s]")
 	}
-	cfg := airplay.Config{Helper: *helper, HelperSHA256: *checksum, Host: *host, Port: *port, PairingFile: *pairFile}
+	cfg := airplay.Config{Helper: *helper, HelperSHA256: *checksum, Host: *host, Port: *port, PairingFile: *pairFile, Transport: airplay.Transport{Rate: *rate, Timing: *timing}}
+	if _, err := cfg.Transport.Normalize(); err != nil {
+		return err
+	}
 	if *offset != "" {
 		n, e := strconv.ParseInt(*offset, 10, 64)
 		if e != nil {
@@ -141,6 +147,16 @@ func runAirPlay(ctx context.Context, args []string, out, errOut io.Writer) error
 	}
 	if args[0] == "play" && cfg.ClockOffsetNS != nil {
 		return errors.New("CLI playback requires wall clock; use the adapter for an externally coordinated clock")
+	}
+	var mapping *session.Mapping
+	if cfg.Transport.Timing == "ptp" && cfg.ClockOffsetNS == nil {
+		clock, err := session.NewRawClock()
+		if err != nil {
+			return err
+		}
+		frozen := session.Freeze(clock, time.Now)
+		mapping = &frozen
+		cfg.ClockOffsetNS = &frozen.OffsetNS
 	}
 	var samples []float32
 	if args[0] == "play" {
@@ -210,7 +226,11 @@ func runAirPlay(ctx context.Context, args []string, out, errOut io.Writer) error
 		return e
 	}
 
-	anchor, e := adapter.Start(ctx, 1, time.Now().Add(3*time.Second))
+	start := time.Now().Add(3 * time.Second)
+	if mapping != nil {
+		start = mapping.Time(mapping.Clock.Now() + 3*time.Second)
+	}
+	anchor, e := adapter.Start(ctx, 1, start)
 	if e != nil {
 		return e
 	}
@@ -221,8 +241,21 @@ func runAirPlay(ctx context.Context, args []string, out, errOut io.Writer) error
 		}
 		i = end
 	}
+	if e = adapter.Finish(ctx); e != nil {
+		return e
+	}
 	length, _ := audio.SampleTime(uint64(len(samples)/2), 48000)
-	timer := time.NewTimer(time.Until(anchor.At.Add(length)))
+	length += time.Duration(adapter.Status().DurationPaddingNS)
+	if mapping != nil {
+		if e = mapping.Clock.WaitUntil(ctx, time.Duration(anchor.At.UnixNano()-mapping.OffsetNS)+length); e != nil {
+			return e
+		}
+	}
+	wait := time.Until(anchor.At.Add(length))
+	if mapping != nil {
+		wait = 0
+	}
+	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
