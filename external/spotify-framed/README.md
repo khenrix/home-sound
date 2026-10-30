@@ -38,7 +38,9 @@ When distributing a helper binary, supply the complete patched corresponding
 source, this patch, build configuration, upstream and dependency notices, and
 GPL license. A process boundary is an engineering separation, not a legal
 claim about arbitrary combined distributions. The generated binary hash and
-actual build information must accompany deployment. No binary is committed.
+actual build information must accompany deployment. No binary is committed. `build-verification.json` records the current patch,
+source pin, toolchain, native dependency manifest and independently reproduced
+binary hashes; it is software build evidence, not live acceptance.
 
 ## Protocol version 1
 
@@ -74,6 +76,15 @@ track's nonempty final read retains its generation even when that same read
 promotes the next track. Re-acknowledging that prefetched source does not
 increment generation. Failed seek does not reset the frame offset.
 
+Borrowed prefetch loads reuse the stream's canonical wrapper. Nonzero-position
+loads enter the player's framed seek command; the switching-source lock covers
+both decoder seek and installation, even when Read already promoted it. One
+successful command creates one generation and clears a pending old EOF notice.
+The output stays paused across this boundary until the requested transport is
+restored. Cancellation before the locked operation does not seek or close the
+borrowed decoder; cancellation after that operation starts is not a transactional
+rollback of the decoder. Native seek failure position recovery remains unverified.
+
 There is one serialized writer and no PCM queue. The source mutex is released
 before writing. Writes have a 250 ms deadline; controls have a 500 ms bound.
 Pause and Drop acknowledge only after the prior response has completed or the
@@ -81,6 +92,10 @@ connection has failed. Drop leaves production paused until explicit Resume.
 An acknowledged barrier cannot have a later old response in that writer;
 bytes already received by the core must still be discarded by owner/generation
 when replacing a session. Closing the socket interrupts blocked transport.
+Unexpected read-side EOF also
+notifies the player through its output error channel, so the next admitted
+stream creates a fresh socket and nonce. Intentional local Close does not
+report that expected read-side shutdown as a failure.
 A decoder blocked inside its own Read remains an upstream cancellation limit:
 process-group kill/reap is required as the outer shutdown deadline fallback.
 

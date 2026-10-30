@@ -1,5 +1,5 @@
 diff --git a/daemon/controls.go b/daemon/controls.go
-index cfe8540..5fc42fc 100644
+index cfe8540..63c15e1 100644
 --- a/daemon/controls.go
 +++ b/daemon/controls.go
 @@ -127,6 +127,9 @@ func closeSource(source librespot.AudioSource) {
@@ -22,39 +22,79 @@ index cfe8540..5fc42fc 100644
  	log := p.app.log.WithField("uri", spotId.Uri())
  
  	stream := opts.prefetchedStream
-@@ -987,6 +993,15 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
+@@ -949,7 +955,7 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
+ 		if stream, err = p.player.NewStream(ctx, p.app.client, spotId, p.app.cfg.Bitrate, opts.position); err != nil {
+ 			return nil, 0, fmt.Errorf("failed creating stream for %s: %w", spotId, err)
+ 		}
+-	} else if !opts.fromStart {
++	} else if !opts.fromStart && (p.app.cfg == nil || p.app.cfg.AudioBackend != "framed") {
+ 		// A prefetched stream was created at position zero, so a non-zero start
+ 		// position (an episode's resume point, or a transfer) has to be applied
+ 		// here unless the stream is declared to start from zero: seeking a few
+@@ -987,9 +993,10 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
  		source = p.narrate(ctx, opts.metadata, spotId.Uri(), source, opts.introPrefix)
  	}
  
+-	if err := p.player.SetPrimaryStream(source, opts.paused, opts.drop); err != nil {
++	if err := p.installFetchedSource(ctx, stream, source, opts); err != nil {
+ 		return nil, 0, fmt.Errorf("failed setting stream for %s: %w", spotId, err)
+ 	}
++
+ 	streamGen := p.player.StreamGen()
+ 
+ 	p.sess.Events().PostPrimaryStreamLoad(stream, opts.paused)
+@@ -997,6 +1004,26 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
+ 	return stream, streamGen, nil
+ }
+ 
++// installFetchedSource is shared by ordinary load and borrowed-prefetch load.
++// Framed borrowed seeks must never call the decoder directly: it may already
++// be the primary source after automatic promotion on the output goroutine.
++func (p *AppPlayer) installFetchedSource(ctx context.Context, stream *player.Stream, source librespot.AudioSource, opts fetchTrackOpts) error {
 +	if err := ctx.Err(); err != nil {
 +		if opts.prefetchedStream == nil {
 +			closeSource(source)
 +		}
-+		return nil, 0, err
++		return err
 +	}
 +	if p.app.cfg != nil && p.app.cfg.AudioBackend == "framed" {
 +		source = stream.FramedSource(source)
++		if opts.prefetchedStream != nil && !opts.fromStart {
++			position := player.StartPosition(opts.position, int64(stream.Media.Duration()))
++			return p.player.SetPrimaryStreamAt(ctx, source, opts.paused, position)
++		}
 +	}
- 	if err := p.player.SetPrimaryStream(source, opts.paused, opts.drop); err != nil {
- 		return nil, 0, fmt.Errorf("failed setting stream for %s: %w", spotId, err)
- 	}
++	return p.player.SetPrimaryStream(source, opts.paused, opts.drop)
++}
++
+ // commitLoad reports the track the player is now on. Runs on the player loop.
+ func (p *AppPlayer) commitLoad(stream *player.Stream, uri string, paused bool, trackPosition int64, prefetched bool) {
+ 	p.primaryStream = stream
 diff --git a/daemon/framed_test.go b/daemon/framed_test.go
 new file mode 100644
-index 0000000..cbf9566
+index 0000000..c0eacef
 --- /dev/null
 +++ b/daemon/framed_test.go
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,201 @@
 +//go:build test_unit
 +
 +package daemon
 +
 +import (
 +	"context"
++	"encoding/binary"
++	"encoding/json"
 +	"errors"
++	"fmt"
 +	librespot "github.com/devgianlu/go-librespot"
 +	"github.com/devgianlu/go-librespot/player"
 +	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
++	"io"
++	"math"
++	"net"
++	"path/filepath"
 +	"testing"
++	"time"
 +)
 +
 +type frameTestSource struct {
@@ -97,9 +137,9 @@ index 0000000..cbf9566
 +	}
 +}
 +
-+func TestFramedCanceledBorrowedPrefetchIsNotClosed(t *testing.T) {
++func TestCanceledBorrowedPrefetchIsNotClosed(t *testing.T) {
 +	p := newTestAppPlayer(t)
-+	p.app.cfg = &Config{AudioBackend: "framed"}
++	p.app.cfg = &Config{AudioBackend: "pipe"}
 +	s := frameTestStream()
 +	ctx, cancel := context.WithCancel(context.Background())
 +	defer cancel()
@@ -113,12 +153,136 @@ index 0000000..cbf9566
 +		t.Fatal("canceled loader closed player-owned prefetched source")
 +	}
 +}
++
++type borrowedPCM struct {
++	value         float32
++	seeks, closed int
++}
++
++func (s *borrowedPCM) Read(p []float32) (int, error) { p[0], p[1] = s.value, s.value; return 2, io.EOF }
++func (s *borrowedPCM) SetPositionMs(int64) error     { s.seeks++; s.value = 9; return nil }
++func (s *borrowedPCM) PositionMs() int64             { return 0 }
++func (s *borrowedPCM) Close() error                  { s.closed++; return nil }
++
++type fetchedInstaller interface {
++	installFetchedSource(context.Context, *player.Stream, librespot.AudioSource, fetchTrackOpts) error
++}
++
++func TestFramedDaemonBorrowedSeekBeforeAndAfterPromotion(t *testing.T) {
++	for _, promoted := range []bool{false, true} {
++		t.Run(fmt.Sprint(promoted), func(t *testing.T) {
++			path := filepath.Join(t.TempDir(), "pcm.sock")
++			listener, e := net.Listen("unix", path)
++			if e != nil {
++				t.Fatal(e)
++			}
++			defer listener.Close()
++			listener.(*net.UnixListener).SetDeadline(time.Now().Add(2 * time.Second))
++			pl, e := player.NewPlayer(&player.Options{Log: &librespot.NullLogger{}, AudioBackend: "framed", AudioOutputPipe: path, ExternalVolume: true, VolumeUpdate: make(chan float32, 1)})
++			if e != nil {
++				t.Fatal(e)
++			}
++			defer pl.Close()
++			p := &AppPlayer{app: &App{cfg: &Config{AudioBackend: "framed"}, log: &librespot.NullLogger{}}, player: pl}
++			install, ok := any(p).(fetchedInstaller)
++			if !ok {
++				t.Fatal("daemon has no atomic borrowed-source installation boundary")
++			}
++			old := frameTestStream()
++			old.Source = &borrowedPCM{value: 1}
++			next := frameTestStream()
++			decoder := &borrowedPCM{value: 2}
++			next.Source = decoder
++			if e = pl.SetPrimaryStream(old.FramedSource(old.Source), false, false); e != nil {
++				t.Fatal(e)
++			}
++			peer, e := listener.Accept()
++			if e != nil {
++				t.Fatal(e)
++			}
++			defer peer.Close()
++			p.commitPrefetch(next, next.Source)
++			type response struct {
++				Generation, Offset          uint64
++				Reason, Transport, Terminal string
++				PCM                         []byte
++			}
++			read := func(credit byte) response {
++				t.Helper()
++				peer.SetDeadline(time.Now().Add(time.Second))
++				if _, e = peer.Write([]byte{credit}); e != nil {
++					t.Fatal(e)
++				}
++				var n uint32
++				if e = binary.Read(peer, binary.BigEndian, &n); e != nil {
++					t.Fatal(e)
++				}
++				if n > 32768 {
++					t.Fatal("oversized record")
++				}
++				b := make([]byte, n)
++				if _, e = io.ReadFull(peer, b); e != nil {
++					t.Fatal(e)
++				}
++				var r response
++				if e = json.Unmarshal(b, &r); e != nil {
++					t.Fatal(e)
++				}
++				return r
++			}
++			if promoted {
++				r := read(1)
++				if binary.LittleEndian.Uint32(r.PCM) != math.Float32bits(1) {
++					t.Fatal("wrong old tail")
++				}
++			}
++			before := read(2).Generation
++			if e = install.installFetchedSource(context.Background(), next, next.Source, fetchTrackOpts{prefetchedStream: next, prefetchedSource: p.secondarySource, position: 100, paused: true}); e != nil {
++				t.Fatal(e)
++			}
++			state := read(2)
++			if state.Generation != before+1 || state.Offset != 0 || state.Reason != "seek" || state.Transport != "paused" || decoder.seeks != 1 {
++				t.Fatalf("paused borrowed seek %+v; seeks=%d", state, decoder.seeks)
++			}
++			if r := read(1); len(r.PCM) != 0 {
++				t.Fatal("paused seek produced audio")
++			}
++			if e = pl.Play(); e != nil {
++				t.Fatal(e)
++			}
++			r := read(1)
++			if len(r.PCM) != 8 || binary.LittleEndian.Uint32(r.PCM) != math.Float32bits(9) || r.Generation != state.Generation || r.Offset != 0 || r.Terminal != "track_end" {
++				t.Fatalf("wrong new source/tail %+v", r)
++			}
++			if after := read(2); after.Generation != state.Generation || after.Reason == "prefetch" {
++				t.Fatalf("borrowed decoder promoted into itself %+v", after)
++			}
++		})
++	}
++}
++func TestFramedDaemonCanceledBorrowedInstallationDoesNotSeekOrClose(t *testing.T) {
++	p := newTestAppPlayer(t)
++	p.app.cfg = &Config{AudioBackend: "framed"}
++	install, ok := any(p).(fetchedInstaller)
++	if !ok {
++		t.Fatal("daemon has no atomic borrowed-source installation boundary")
++	}
++	s := frameTestStream()
++	decoder := &borrowedPCM{value: 2}
++	s.Source = decoder
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	e := install.installFetchedSource(ctx, s, s.Source, fetchTrackOpts{prefetchedStream: s, position: 100})
++	if !errors.Is(e, context.Canceled) || decoder.seeks != 0 || decoder.closed != 0 {
++		t.Fatalf("canceled borrowed source changed: %v seeks=%d close=%d", e, decoder.seeks, decoder.closed)
++	}
++}
 diff --git a/output/driver-framed.go b/output/driver-framed.go
 new file mode 100644
-index 0000000..6a97ab1
+index 0000000..45ae731
 --- /dev/null
 +++ b/output/driver-framed.go
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,212 @@
 +package output
 +
 +import (
@@ -208,6 +372,11 @@ index 0000000..6a97ab1
 +			if e != nil {
 +				if n, ok := e.(net.Error); ok && n.Timeout() {
 +					continue
++				}
++				select {
++				case <-f.closed:
++				default:
++					f.err <- errors.New("framed consumer disconnected")
 +				}
 +				return
 +			}
@@ -328,10 +497,10 @@ index 0000000..6a97ab1
 +}
 diff --git a/output/framed_test.go b/output/framed_test.go
 new file mode 100644
-index 0000000..538ab97
+index 0000000..e179dfe
 --- /dev/null
 +++ b/output/framed_test.go
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,287 @@
 +package output
 +
 +import (
@@ -588,6 +757,37 @@ index 0000000..538ab97
 +		t.Fatalf("state read consumed PCM or lost generation: %+v", r)
 +	}
 +}
++func TestFramedIdlePeerDisconnectNotifiesPlayer(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "pcm.sock")
++	l, e := net.Listen("unix", path)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer l.Close()
++	out, e := newFramedOutput(&NewOutputOptions{Reader: &framedFixture{}, OutputPipe: path, SampleRate: 44100, ChannelCount: 2, ExternalVolume: true})
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer out.Close()
++	c, e := l.Accept()
++	if e != nil {
++		t.Fatal(e)
++	}
++	c.Close()
++	select {
++	case <-out.(*framedOutput).done:
++	case <-time.After(time.Second):
++		t.Fatal("writer did not exit")
++	}
++	select {
++	case e := <-out.Error():
++		if e == nil {
++			t.Fatal("disconnect error missing")
++		}
++	default:
++		t.Fatal("peer EOF did not notify player Error channel")
++	}
++}
 diff --git a/output/output.go b/output/output.go
 index 4470f02..d9a1927 100644
 --- a/output/output.go
@@ -601,18 +801,69 @@ index 4470f02..d9a1927 100644
  	case "alsa":
  		out, err := newAlsaOutput(options)
  		if err != nil {
-diff --git a/player/framed_source_test.go b/player/framed_source_test.go
+diff --git a/player/framed_player_test.go b/player/framed_player_test.go
 new file mode 100644
-index 0000000..23a5df6
+index 0000000..12d706b
 --- /dev/null
-+++ b/player/framed_source_test.go
-@@ -0,0 +1,112 @@
++++ b/player/framed_player_test.go
+@@ -0,0 +1,37 @@
++//go:build test_unit
++
 +package player
 +
 +import (
-+	"errors"
-+	"io"
++	"context"
++	librespot "github.com/devgianlu/go-librespot"
 +	"testing"
++)
++
++func TestFramedPlayerPausedBorrowedSeekUsesTaggedSource(t *testing.T) {
++	out := &recordingOutput{}
++	p := newTestPlayer(t, out)
++	first := &sentinel{value: 1, identity: `{"uri":"old"}`}
++	next := &sentinel{value: 2, identity: `{"uri":"next"}`}
++	if e := p.SetPrimaryStream(first, false, false); e != nil {
++		t.Fatal(e)
++	}
++	p.SetSecondaryStream(next)
++	installer, ok := any(p).(interface {
++		SetPrimaryStreamAt(context.Context, librespot.AudioSource, bool, int64) error
++	})
++	if !ok {
++		t.Fatal("player cannot route borrowed seek through locked tagged source")
++	}
++	if e := installer.SetPrimaryStreamAt(context.Background(), next, true, 123); e != nil {
++		t.Fatal(e)
++	}
++	g, offset, _, reason := out.source.FramedState()
++	if g != 2 || offset != 0 || reason != "seek" {
++		t.Fatalf("seek state %d %d %s", g, offset, reason)
++	}
++	calls := out.snapshot()
++	if calls[len(calls)-1] != "Pause" {
++		t.Fatalf("paused load resumed output: %v", calls)
++	}
++}
+diff --git a/player/framed_source_test.go b/player/framed_source_test.go
+new file mode 100644
+index 0000000..7e42acd
+--- /dev/null
++++ b/player/framed_source_test.go
+@@ -0,0 +1,235 @@
++package player
++
++import (
++	"context"
++	"encoding/binary"
++	"encoding/json"
++	"errors"
++	"fmt"
++	librespot "github.com/devgianlu/go-librespot"
++	"io"
++	"net"
++	"path/filepath"
++	"testing"
++	"time"
 +)
 +
 +// These fixtures exercise SwitchingAudioSource itself, including promotion in Read.
@@ -719,18 +970,134 @@ index 0000000..23a5df6
 +		t.Fatalf("state %d %d %s %s", g, o, id, reason)
 +	}
 +}
++func TestFramedPlayerDisconnectReopensSocketAndNonce(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "pcm.sock")
++	l, e := net.Listen("unix", path)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer l.Close()
++	p, e := NewPlayer(&Options{Log: &librespot.NullLogger{}, AudioBackend: "framed", AudioOutputPipe: path, ExternalVolume: true, VolumeUpdate: make(chan float32, 1)})
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer p.Close()
++	nonce := func(c net.Conn) string {
++		t.Helper()
++		c.SetDeadline(time.Now().Add(time.Second))
++		if _, e := c.Write([]byte{1}); e != nil {
++			t.Fatal(e)
++		}
++		var size uint32
++		if e = binary.Read(c, binary.BigEndian, &size); e != nil {
++			t.Fatal(e)
++		}
++		if size > 32768 {
++			t.Fatal("oversized record")
++		}
++		b := make([]byte, size)
++		if _, e = io.ReadFull(c, b); e != nil {
++			t.Fatal(e)
++		}
++		var r struct{ Nonce string }
++		if e = json.Unmarshal(b, &r); e != nil {
++			t.Fatal(e)
++		}
++		return r.Nonce
++	}
++	if e = p.SetPrimaryStream(&sentinel{value: 1, identity: `{"uri":"a"}`}, false, false); e != nil {
++		t.Fatal(e)
++	}
++	c, e := l.Accept()
++	if e != nil {
++		t.Fatal(e)
++	}
++	first := nonce(c)
++	c.Close()
++	deadline := time.After(time.Second)
++	stopped := false
++	for !stopped {
++		select {
++		case event := <-p.Receive():
++			stopped = event.Type == EventTypeStop && event.Err != nil
++		case <-deadline:
++			t.Fatal("player retained dead framed output after peer EOF")
++		}
++	}
++	if e = p.SetPrimaryStream(&sentinel{value: 2, identity: `{"uri":"b"}`}, false, true); e != nil {
++		t.Fatalf("next admitted source did not reopen: %v", e)
++	}
++	l.(*net.UnixListener).SetDeadline(time.Now().Add(time.Second))
++	next, e := l.Accept()
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer next.Close()
++	if got := nonce(next); got == first || len(got) != 32 {
++		t.Fatalf("reused output nonce %q", got)
++	}
++}
++func TestFramedAtomicBorrowedSeekBeforeAndAfterPromotion(t *testing.T) {
++	for _, promoted := range []bool{false, true} {
++		t.Run(fmt.Sprint(promoted), func(t *testing.T) {
++			s := NewSwitchingAudioSource(0)
++			s.SetPrimary(&sentinel{value: 1, eof: true, identity: `{"uri":"old"}`})
++			next := &sentinel{value: 2, eof: true, identity: `{"uri":"next"}`}
++			s.SetSecondary(next)
++			if promoted {
++				s.ReadTagged(make([]float32, 2))
++			}
++			before, _, _, _ := s.FramedState()
++			seeker, ok := any(s).(interface {
++				SetPrimaryAt(context.Context, librespot.AudioSource, int64) error
++			})
++			if !ok {
++				t.Fatal("borrowed seek cannot be installed atomically under read/generation lock")
++			}
++			if e := seeker.SetPrimaryAt(context.Background(), next, 123); e != nil {
++				t.Fatal(e)
++			}
++			g, off, _, reason := s.FramedState()
++			if g != before+1 || off != 0 || reason != "seek" {
++				t.Fatalf("seek boundary %d %d %s", g, off, reason)
++			}
++			buf := make([]float32, 2)
++			_, readGen, _, _, _, e := s.ReadTagged(buf)
++			after, _, _, _ := s.FramedState()
++			if readGen != g || after != g || e != io.EOF || buf[0] != 9 {
++				t.Fatalf("seek tail/promotion %d %d %v %v", readGen, after, e, buf)
++			}
++		})
++	}
++}
++func TestFramedBorrowedSeekClearsPriorEOFNotice(t *testing.T) {
++	s := NewSwitchingAudioSource(0)
++	s.SetPrimary(&sentinel{value: 1, eof: true, identity: `{"uri":"old"}`})
++	next := &sentinel{value: 2, identity: `{"uri":"next"}`}
++	s.SetSecondary(next)
++	s.ReadTagged(make([]float32, 2))
++	if e := s.SetPrimaryAt(context.Background(), next, 123); e != nil {
++		t.Fatal(e)
++	}
++	select {
++	case <-s.Done():
++		t.Fatal("old EOF notification survived acknowledged borrowed seek")
++	default:
++	}
++}
 diff --git a/player/framed_stream_test.go b/player/framed_stream_test.go
 new file mode 100644
-index 0000000..ee7dffb
+index 0000000..bf09bb5
 --- /dev/null
 +++ b/player/framed_stream_test.go
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,55 @@
 +package player
 +
 +import (
 +	"encoding/json"
 +	librespot "github.com/devgianlu/go-librespot"
 +	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
++	"io"
 +	"testing"
 +)
 +
@@ -765,11 +1132,132 @@ index 0000000..ee7dffb
 +		t.Fatal("metadata not immutable")
 +	}
 +}
++func TestFramedPrefetchReuseDoesNotPromoteDecoderAlias(t *testing.T) {
++	name := "Track"
++	base := &sentinel{value: 2, eof: true}
++	stream := &Stream{RequestedId: librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeTrack, make([]byte, 16)), Media: librespot.NewMediaFromTrack(&metadatapb.Track{Name: &name}), Source: base}
++	s := NewSwitchingAudioSource(0)
++	s.SetPrimary(&sentinel{value: 1, identity: `{"uri":"old"}`})
++	s.SetSecondary(stream.FramedSource(base))
++	s.SetPrimary(stream.FramedSource(base))
++	_, g, _, _, _, e := s.ReadTagged(make([]float32, 2))
++	next, _, _, reason := s.FramedState()
++	if e != io.EOF || next != g {
++		t.Fatalf("borrowed decoder alias promoted again: generation %d -> %d reason %s error %v", g, next, reason, e)
++	}
++}
+diff --git a/player/player.go b/player/player.go
+index 8d45e52..7b82117 100644
+--- a/player/player.go
++++ b/player/player.go
+@@ -102,10 +102,12 @@ type playerCmd struct {
+ }
+ 
+ type playerCmdDataSet struct {
+-	source  librespot.AudioSource
+-	primary bool
+-	paused  bool
+-	drop    bool
++	ctx      context.Context
++	position *int64
++	source   librespot.AudioSource
++	primary  bool
++	paused   bool
++	drop     bool
+ }
+ 
+ type Options struct {
+@@ -271,6 +273,10 @@ loop:
+ 			switch cmd.typ {
+ 			case playerCmdSet:
+ 				data := cmd.data.(playerCmdDataSet)
++				if data.ctx != nil && data.ctx.Err() != nil {
++					cmd.resp <- data.ctx.Err()
++					break
++				}
+ 				if !data.primary {
+ 					source.SetSecondary(data.source)
+ 					cmd.resp <- nil
+@@ -278,6 +284,7 @@ loop:
+ 				}
+ 
+ 				// create a new output device if needed
++				created := out == nil
+ 				if out == nil {
+ 					var err error
+ 					out, err = p.newOutput(source, volume, device)
+@@ -294,14 +301,31 @@ loop:
+ 				// new track's opening is buffered then dropped, clipping it on
+ 				// pulseaudio (#292).
+ 				if data.drop {
+-					_ = out.Drop()
++					if err := out.Drop(); err != nil && data.position != nil {
++						cmd.resp <- err
++						break
++					}
+ 				}
+ 
+ 				// Counted before the events below so they carry the stream they
+ 				// describe, and so that whoever set it can tell which that was.
+-				p.streamGen.Add(1)
+-
+-				source.SetPrimary(data.source)
++				if data.position != nil {
++					if err := source.SetPrimaryAt(data.ctx, data.source, *data.position); err != nil {
++						if created {
++							_ = out.Close()
++							out = nil
++							outErr = make(<-chan error)
++						} else if !paused {
++							err = errors.Join(err, out.Resume())
++						}
++						cmd.resp <- err
++						break
++					}
++					p.streamGen.Add(1)
++				} else {
++					p.streamGen.Add(1)
++					source.SetPrimary(data.source)
++				}
+ 				if data.paused {
+ 					if err := out.Pause(); err != nil {
+ 						cmd.resp <- err
+@@ -606,6 +630,22 @@ func (p *Player) SetPrimaryStream(source librespot.AudioSource, paused, drop boo
+ 	return nil
+ }
+ 
++// SetPrimaryStreamAt installs/seeks a framed borrowed source as one read-coupled
++// operation. Drop holds output paused until the source boundary is established.
++func (p *Player) SetPrimaryStreamAt(ctx context.Context, source librespot.AudioSource, paused bool, position int64) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	resp := make(chan any)
++	if !p.send(playerCmd{typ: playerCmdSet, data: playerCmdDataSet{ctx: ctx, position: &position, source: source, primary: true, paused: paused, drop: true}, resp: resp}) {
++		return ErrPlayerClosed
++	}
++	if err := <-resp; err != nil {
++		return err.(error)
++	}
++	return nil
++}
++
+ func (p *Player) SetSecondaryStream(source librespot.AudioSource) {
+ 	resp := make(chan any)
+ 	if !p.send(playerCmd{typ: playerCmdSet, data: playerCmdDataSet{source: source, primary: false}, resp: resp}) {
 diff --git a/player/source.go b/player/source.go
-index 5611067..70c7f42 100644
+index 5611067..6da2a7f 100644
 --- a/player/source.go
 +++ b/player/source.go
-@@ -27,7 +27,9 @@ type SwitchingAudioSource struct {
+@@ -1,6 +1,7 @@
+ package player
+ 
+ import (
++	"context"
+ 	"errors"
+ 	"io"
+ 	"math"
+@@ -27,7 +28,9 @@ type SwitchingAudioSource struct {
  
  	done chan struct{}
  
@@ -780,7 +1268,17 @@ index 5611067..70c7f42 100644
  
  	// Crossfade state. When crossfadeSamples is zero the source behaves
  	// exactly as it did before crossfade support was introduced.
-@@ -93,6 +95,9 @@ func (s *SwitchingAudioSource) SetPrimary(source librespot.AudioSource) {
+@@ -83,6 +86,9 @@ func NewSwitchingAudioSource(crossfadeSamples int) *SwitchingAudioSource {
+ func (s *SwitchingAudioSource) SetPrimary(source librespot.AudioSource) {
+ 	s.cond.L.Lock()
+ 	defer s.cond.L.Unlock()
++	s.setPrimaryLocked(source)
++}
++func (s *SwitchingAudioSource) setPrimaryLocked(source librespot.AudioSource) {
+ 
+ 	// After a crossfade begins, the incoming source has already been promoted
+ 	// to the primary slot. The daemon acknowledges the very same transition
+@@ -93,6 +99,9 @@ func (s *SwitchingAudioSource) SetPrimary(source librespot.AudioSource) {
  		// in-flight crossfade tail.
  		s.resetCrossfade()
  		s.source[s.which] = source
@@ -790,7 +1288,7 @@ index 5611067..70c7f42 100644
  	}
  
  	// If the same source was also prefetched into the secondary slot (e.g. a
-@@ -169,6 +174,9 @@ func (s *SwitchingAudioSource) readDirect(p []float32) (n int, err error) {
+@@ -169,6 +178,9 @@ func (s *SwitchingAudioSource) readDirect(p []float32) (n int, err error) {
  		// delete current source and switch to the other one
  		delete(s.source, s.which)
  		s.which = !s.which
@@ -800,7 +1298,7 @@ index 5611067..70c7f42 100644
  
  		// ignore the EOF, we have more data
  		return n, nil
-@@ -420,6 +428,9 @@ func (s *SwitchingAudioSource) SetPositionMs(pos int64) error {
+@@ -420,6 +432,9 @@ func (s *SwitchingAudioSource) SetPositionMs(pos int64) error {
  		return err
  	}
  
@@ -810,7 +1308,7 @@ index 5611067..70c7f42 100644
  	if s.crossfadeSamples > 0 {
  		// The crossfade path can discover EOF and report done well before the
  		// audio finishes; a seek revives the source, so re-arm the signal.
-@@ -461,3 +472,42 @@ func (s *SwitchingAudioSource) Close() error {
+@@ -461,3 +476,70 @@ func (s *SwitchingAudioSource) Close() error {
  	}
  	return err
  }
@@ -853,20 +1351,57 @@ index 5611067..70c7f42 100644
 +	}
 +	return s.pcmGeneration, s.pcmOffset, identity, s.pcmReason
 +}
++
++// SetPrimaryAt is the framed borrowed-prefetch boundary. A decoder may already
++// have been promoted by Read, so both the seek and any source installation must
++// occur under the read lock. One successful operation creates one PCM boundary.
++func (s *SwitchingAudioSource) SetPrimaryAt(ctx context.Context, source librespot.AudioSource, position int64) error {
++	s.cond.L.Lock()
++	defer s.cond.L.Unlock()
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	if s.crossfadeSamples != 0 {
++		return errors.New("framed seek requires crossfade disabled")
++	}
++	if err := source.SetPositionMs(position); err != nil {
++		return err
++	}
++	generation := s.pcmGeneration
++	s.setPrimaryLocked(source)
++	s.pcmGeneration = generation + 1
++	s.pcmOffset = 0
++	s.pcmReason = "seek"
++	// A pending EOF belongs to the replaced timeline, not this new seek.
++	select {
++	case <-s.done:
++	default:
++	}
++	return nil
++}
 diff --git a/player/stream.go b/player/stream.go
-index 13df76b..b348575 100644
+index 13df76b..0d680a4 100644
 --- a/player/stream.go
 +++ b/player/stream.go
-@@ -2,6 +2,8 @@ package player
+@@ -2,12 +2,17 @@ package player
  
  import (
  	"bytes"
 +	"encoding/json"
 +	"strings"
++	"sync"
  
  	librespot "github.com/devgianlu/go-librespot"
  	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
-@@ -45,3 +47,55 @@ func (s *Stream) Is(id librespot.SpotifyId) bool {
+ )
+ 
+ type Stream struct {
++	framedMu   sync.Mutex
++	framedBase *framedSource
+ 	PlaybackId []byte
+ 
+ 	// RequestedId is the id this stream was created for, before any relinking
+@@ -45,3 +50,64 @@ func (s *Stream) Is(id librespot.SpotifyId) bool {
  		return false
  	}
  }
@@ -874,6 +1409,11 @@ index 13df76b..b348575 100644
 +// FramedSource binds display identity before installation. A previously tagged
 +// prefetch wrapper is returned unchanged so acknowledgement cannot reset PCM.
 +func (s *Stream) FramedSource(source librespot.AudioSource) librespot.AudioSource {
++	s.framedMu.Lock()
++	defer s.framedMu.Unlock()
++	if source == s.Source && s.framedBase != nil {
++		return s.framedBase
++	}
 +	if _, ok := source.(*framedSource); ok {
 +		return source
 +	}
@@ -904,7 +1444,11 @@ index 13df76b..b348575 100644
 +	if _, ok := source.(interface{ NoCrossfade() bool }); ok {
 +		identity = nil
 +	}
-+	return &framedSource{source, string(identity)}
++	wrapped := &framedSource{source, string(identity)}
++	if source == s.Source {
++		s.framedBase = wrapped
++	}
++	return wrapped
 +}
 +
 +type framedSource struct {

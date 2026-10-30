@@ -1,0 +1,25 @@
+{
+  "upstream": "https://github.com/devgianlu/go-librespot",
+  "release": "v0.10.5",
+  "commit": "90a4fdaf0314269e3fa25698a5f4270c026d2c03",
+  "patch_sha256": "d5e324373c6ae4e0852ce15313e04f25594ab78fee29280f04ef866c8027b1b2",
+  "binary_sha256": "96597e3c85cd195694bda010421f39e044975a794385b1865cebcce517d83649",
+  "reproduction_binary_sha256": "96597e3c85cd195694bda010421f39e044975a794385b1865cebcce517d83649",
+  "toolchain": "go1.27.3",
+  "goos": "linux",
+  "goarch": "amd64",
+  "goamd64": "v1",
+  "cgo_enabled": true,
+  "build_flags": [
+    "-trimpath"
+  ],
+  "native_dependencies_manifest_sha256": "a961b884551824677d64e31a0f8bdf3da7404681f39ebb4093f84ef5bd6df341",
+  "checks": [
+    "go test -race -tags test_unit -count=1 ./...",
+    "go vet -tags test_unit ./...",
+    "go build -trimpath ./cmd/daemon"
+  ],
+  "umask": "022",
+  "binary_execution": "not launched as a daemon; controlled helper package subprocess fixtures only",
+  "hardware_acceptance": "unverified"
+}
