@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/khenrix/home-sound/internal/audio"
+	"github.com/khenrix/home-sound/internal/volume"
 )
 
 var backoff = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second}
@@ -43,6 +44,7 @@ func (s *running) memberLoop(m *member) {
 		resume := m.resumePending || s.resuming
 		firstResume := s.pausedSample
 		m.resumePending = false
+		m.reconfigure = false
 		m.attemptDone = make(chan struct{})
 		m.state.Attempts++
 		m.state.State = "preparing"
@@ -65,10 +67,24 @@ func (s *running) memberLoop(m *member) {
 			s.mu.Unlock()
 			return
 		}
+		if m.state.LastError == "stop_failed" {
+			// A failed flush leaves the receiver's buffered gain unknown.
+			m.state.State = "stop_failed"
+			s.mu.Unlock()
+			return
+		}
 		if s.muted || s.paused && !s.resuming {
 			s.mu.Unlock()
 			recovering = false
 			delayIndex = 0
+			continue
+		}
+		if m.reconfigure || m.resumePending {
+			if stable {
+				recovering = false
+				delayIndex = 0
+			}
+			s.mu.Unlock()
 			continue
 		}
 		if err == nil {
@@ -134,7 +150,7 @@ func (s *running) attempt(m *member, first uint64, deadline time.Duration, resum
 	m.context = ctx
 	token := m.state.Attempts
 	done := m.attemptDone
-	if s.paused && !s.resuming || token > 1 && s.sourceState != "reading" && !resume {
+	if m.reconfigure || s.paused && !s.resuming || token > 1 && s.sourceState != "reading" && !resume {
 		cancel()
 	}
 	s.mu.Unlock()
@@ -184,6 +200,7 @@ func (s *running) attempt(m *member, first uint64, deadline time.Duration, resum
 
 	s.mu.Lock()
 	plan := m.plan
+	m.feedback = volume.NewFeedback(s.engine.cfg.Profiles[m.id], s.engine.cfg.Devices[m.id].RoomTrimDB)
 	m.feedback.Expect(plan.Native)
 	s.mu.Unlock()
 	if err = out.SetNative(ctx, plan.Native); err != nil {
@@ -234,9 +251,9 @@ func (s *running) attempt(m *member, first uint64, deadline time.Duration, resum
 			nextMetadata := s.metadata
 			s.mu.Unlock()
 			if desired.Native != plan.Native {
-				if err = out.SetNative(ctx, desired.Native); err != nil {
-					return err, started, preparedIn
-				}
+				// The control path canceled this attempt; never apply a native
+				// step to PCM buffered with this output's earlier attenuation.
+				return context.Canceled, started, preparedIn
 			}
 			plan = desired
 			if metadata != nextMetadata {

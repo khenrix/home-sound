@@ -14,9 +14,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -54,6 +56,22 @@ func TestHelperProcess(t *testing.T) {
 	if mode == "exit" {
 		fmt.Println("[STATUS] error code=oops detail=synthetic-secret")
 		os.Exit(2)
+	}
+	if mode == "graceful" || mode == "stopack" {
+		termination := make(chan os.Signal, 1)
+		signal.Notify(termination, syscall.SIGTERM)
+		go func() {
+			<-termination
+			path := os.Getenv("HOME_SOUND_ORDER_PATH")
+			if _, err := os.Stat(path + ".stopped"); err != nil {
+				os.Exit(12)
+			}
+			os.WriteFile(path+".terminated", []byte("orderly teardown"), 0600)
+			os.Exit(0)
+		}()
+	}
+	if mode == "hangstop" || mode == "blockedcommands" {
+		signal.Ignore(syscall.SIGTERM)
 	}
 	f, e := os.OpenFile(get("--cmdpipe"), os.O_RDWR, 0600)
 	if e != nil {
@@ -106,6 +124,11 @@ func TestHelperProcess(t *testing.T) {
 	if mode != "blocked" && mode != "pcm" {
 		go io.Copy(io.Discard, os.Stdin)
 	}
+	if mode == "blockedcommands" {
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
 	s := bufio.NewScanner(f)
 	var requested string
 	pcmOK := false
@@ -116,9 +139,16 @@ func TestHelperProcess(t *testing.T) {
 			os.Exit(11)
 		}
 		if line == "ACTION=STOP" {
-			if mode == "stopack" {
+			if mode == "abruptstop" {
+				os.Exit(2)
+			}
+			if mode == "hangstop" {
+				continue
+			}
+			if mode == "graceful" || mode == "stopack" {
+				os.WriteFile(os.Getenv("HOME_SOUND_ORDER_PATH")+".stopped", []byte("stopped"), 0600)
 				fmt.Fprintln(os.Stderr, "[STATUS] stopped")
-				time.Sleep(20 * time.Millisecond)
+				continue
 			}
 			os.WriteFile(os.Getenv("HOME_SOUND_ORDER_PATH")+".stopped", []byte("stopped"), 0600)
 			os.Exit(0)

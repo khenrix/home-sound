@@ -70,6 +70,7 @@ type MemberStatus struct {
 	LastError        string         `json:"last_error,omitempty"`
 	RecoveryUntil    time.Duration  `json:"recovery_until_raw_ns,omitempty"`
 	Plan             volume.Plan    `json:"volume"`
+	LastRemoteNative *int           `json:"last_remote_native,omitempty"`
 	Transport        airplay.Status `json:"transport"`
 }
 type Event struct {
@@ -134,6 +135,7 @@ type running struct {
 type member struct {
 	context       context.Context
 	resumePending bool
+	reconfigure   bool
 	attemptDone   chan struct{}
 	id            string
 	state         MemberStatus
@@ -295,6 +297,10 @@ func (e *Engine) Status() Status {
 	outputs := map[string]Output{}
 	for id, m := range s.members {
 		st := m.state
+		if st.LastRemoteNative != nil {
+			n := *st.LastRemoteNative
+			st.LastRemoteNative = &n
+		}
 		st.Plan = m.plan
 		st.QueueFrames = uint64(len(m.queue) * chunkFrames)
 		result.Members[id] = st
@@ -358,7 +364,7 @@ func (s *running) targetLocked(target float64) error {
 	for id, p := range plans {
 		m := s.members[id]
 		if m.plan.Native != p.Native {
-			m.feedback.Expect(p.Native)
+			s.reconfigureLocked(m)
 		}
 		m.plan = p
 		select {
@@ -368,6 +374,16 @@ func (s *running) targetLocked(target float64) error {
 	}
 	s.eventLocked("", "target_changed")
 	return nil
+}
+
+// Stop/flush before changing the native basis of already-submitted PCM. The
+// member worker joins the unchanged sample timeline with a fresh output.
+func (s *running) reconfigureLocked(m *member) {
+	if m.cancel != nil && (m.state.State == "preparing" || m.state.State == "streaming") {
+		m.reconfigure = true
+		m.state.State = "reconfiguring"
+		m.cancel()
+	}
 }
 func (e *Engine) NativeChanged(epoch uint64, id string, n int) bool {
 	return e.nativeChanged(epoch, id, 0, n)
@@ -384,10 +400,18 @@ func (e *Engine) nativeChanged(epoch uint64, id string, attempt uint64, n int) b
 		return false
 	}
 	target, changed, err := m.feedback.Observe(n)
-	if err != nil || !changed {
+	if err == nil && !changed {
 		return false
 	}
-	return s.targetLocked(target) == nil
+	// A physical remote step invalidates the gain basis of buffered PCM even
+	// when inversion chooses the same measured step as the previous plan.
+	m.state.LastRemoteNative = &n
+	s.reconfigureLocked(m)
+	if err != nil || s.targetLocked(target) != nil {
+		s.eventLocked(id, "native_change_rejected")
+		return false
+	}
+	return true
 }
 func (e *Engine) Mute(muted bool) error {
 	s := e.currentSession()

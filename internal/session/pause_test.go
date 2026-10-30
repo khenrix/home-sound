@@ -11,6 +11,11 @@ import (
 
 func TestPauseFreezesPositionAndResumesRetainedPrefill(t *testing.T) {
 	e, c, f := setup(t)
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("final status: %+v", e.Status())
+		}
+	})
 	src := &testSource{}
 	epoch := selectSource(t, e, config.AllSpeakers, src)
 	eventually(t, func() bool { return f.latest("hall") != nil && f.latest("hall").Status().Frames >= 96000 })

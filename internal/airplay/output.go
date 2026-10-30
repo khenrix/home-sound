@@ -74,6 +74,9 @@ type Adapter struct {
 	done               chan struct{}
 	dir                string
 	prepared, stopped  bool
+	receiverStopped    bool
+	pcmSubmitted       bool
+	stopErr            error
 	epoch, first, next uint64
 	pending            int64
 	cutRequested       int64
@@ -225,6 +228,8 @@ func (a *Adapter) Prepare(ctx context.Context, epoch, first uint64) (resultErr e
 		return errors.New("cannot open helper command pipe")
 	}
 	cmd := exec.CommandContext(childCtx, a.cfg.Helper, append(args, "--cmdpipe", fifo, a.cfg.Host)...)
+	cmd.Cancel = func() error { return a.cancelHelper(cmd, commands) }
+	cmd.WaitDelay = 2 * time.Second
 	inputR, inputW, e := os.Pipe()
 	if e != nil {
 		commands.Close()
@@ -269,6 +274,11 @@ func (a *Adapter) Prepare(ctx context.Context, epoch, first uint64) (resultErr e
 	go a.readStatus(outputR)
 	go func() {
 		cmd.Wait()
+		a.mu.Lock()
+		if state, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && (state.Signaled() || state.ExitStatus() != 0 && a.pcmSubmitted) {
+			a.stopErr = errors.New("helper terminated without orderly receiver teardown")
+		}
+		a.mu.Unlock()
 		outputR.Close()
 		a.fail()
 		inputW.Close()
@@ -386,6 +396,10 @@ func (a *Adapter) Write(ctx context.Context, f audio.Frame) error {
 	s := a.status
 	valid := s.Ready && s.Healthy && f.Epoch == a.epoch && f.Sample == a.next
 	input := a.input
+	if valid && len(f.Data) > 0 {
+		// A partial pipe write can reach the receiver even when Write fails.
+		a.pcmSubmitted = true
+	}
 	a.mu.Unlock()
 	if !valid {
 		return errors.New("output not ready or stale/noncontiguous frame")
@@ -441,36 +455,6 @@ func (a *Adapter) Metadata(ctx context.Context, m Metadata) error {
 	if err := writeBounded(ctx, a.commands, []byte("TITLE="+m.Title+"\nARTIST="+m.Artist+"\nALBUM="+m.Album+"\nACTION=SENDMETA\n")); err != nil {
 		a.fail()
 		return err
-	}
-	return nil
-}
-func (a *Adapter) Stop() error {
-	a.mu.Lock()
-	healthy, commands, done := a.status.Healthy, a.commands, a.done
-	a.stopped = true
-	a.status.Healthy = false
-	a.status.Ready = false
-	a.signalLocked()
-	a.mu.Unlock()
-	if healthy && commands != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-		err := writeBounded(ctx, commands, []byte("ACTION=STOP\n"))
-		cancel()
-		if err == nil {
-			select {
-			case <-done:
-				return nil
-			case <-time.After(500 * time.Millisecond):
-			}
-		}
-	}
-	a.fail()
-	if done != nil {
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			return errors.New("helper teardown timed out")
-		}
 	}
 	return nil
 }

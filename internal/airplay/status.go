@@ -81,6 +81,9 @@ func (a *Adapter) consume(line string) {
 		a.status.Anchor.Sample += uint64(cutBytes / 4)
 		a.status.Anchor.ContentCutPending = false
 	case "error", "stopped", "eof":
+		if f[1] == "stopped" {
+			a.receiverStopped = true
+		}
 		if f[1] == "error" {
 			a.status.HelperErrorCode, a.status.HelperHTTPStatus = parseHelperError(f[2:])
 		}
