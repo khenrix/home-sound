@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -40,11 +41,14 @@ func (h Helper) Validate() error {
 // to a hard cap and never appears in errors. Close kills/reaps the entire owned
 // process group; cancellation cannot leave a decoder blocked on a full pipe.
 type Process struct {
-	stdout  *os.File
-	cancel  context.CancelFunc
-	done    chan struct{}
-	waitErr error
-	once    sync.Once
+	stdout        *os.File
+	cancel        context.CancelFunc
+	done          chan struct{}
+	waitErr       error
+	exitCode      int
+	exitClass     string
+	stderrLimited atomic.Bool
+	once          sync.Once
 }
 
 func StartProcess(ctx context.Context, h Helper, args []string, lifetime time.Duration) (*Process, error) {
@@ -83,8 +87,9 @@ func startProcess(run context.Context, cancel context.CancelFunc, h Helper, args
 		cancel()
 		return nil, errors.New("source pipe capacity unavailable")
 	}
+	p := &Process{stdout: reader, cancel: cancel, done: make(chan struct{})}
 	cmd.Stdout = writer
-	cmd.Stderr = &discardLimit{remaining: 4096, cancel: cancel}
+	cmd.Stderr = &discardLimit{remaining: 4096, cancel: cancel, limited: &p.stderrLimited}
 	if e = cmd.Start(); e != nil {
 		reader.Close()
 		writer.Close()
@@ -92,8 +97,17 @@ func startProcess(run context.Context, cancel context.CancelFunc, h Helper, args
 		return nil, errors.New("source helper start failed")
 	}
 	writer.Close()
-	p := &Process{stdout: reader, cancel: cancel, done: make(chan struct{})}
-	go func() { p.waitErr = cmd.Wait(); close(p.done) }()
+	go func() {
+		p.waitErr = cmd.Wait()
+		p.exitCode = cmd.ProcessState.ExitCode()
+		p.exitClass = "exit"
+		if p.stderrLimited.Load() {
+			p.exitClass = "stderr_limit"
+		} else if run.Err() != nil {
+			p.exitClass = "canceled"
+		}
+		close(p.done)
+	}()
 	return p, nil
 }
 func (p *Process) Read(ctx context.Context, b []byte) (int, error) {
@@ -133,13 +147,28 @@ func (p *Process) Close() error {
 	}
 }
 
+// ExitDiagnostic returns only fixed categories and the operating-system exit
+// code. It never includes argv, paths, stdout, stderr or error text.
+func (p *Process) ExitDiagnostic() (string, int) {
+	select {
+	case <-p.done:
+		return p.exitClass, p.exitCode
+	default:
+		return "running", -1
+	}
+}
+
 type discardLimit struct {
 	remaining int
+	limited   *atomic.Bool
 	cancel    context.CancelFunc
 }
 
 func (w *discardLimit) Write(p []byte) (int, error) {
 	if len(p) > w.remaining {
+		if w.limited != nil {
+			w.limited.Store(true)
+		}
 		w.cancel()
 		return 0, errors.New("helper diagnostic limit")
 	}

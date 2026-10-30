@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -37,6 +38,9 @@ func TestProcessFixture(t *testing.T) {
 	case "fixture-data":
 		os.Stdout.Write([]byte{1, 2, 3})
 		os.Exit(0)
+	case "fixture-stderr-limit":
+		os.Stderr.WriteString(strings.Repeat("private-token-must-not-escape", 400))
+		time.Sleep(time.Hour)
 	case "fixture-fail":
 		os.Stderr.WriteString("private-token-must-not-escape")
 		os.Exit(9)
@@ -158,4 +162,39 @@ type daemonStarter struct{}
 
 func (daemonStarter) Start(ctx context.Context, h Helper, args []string) (*Process, error) {
 	return StartDaemon(ctx, h, args)
+}
+
+func TestProcessExitDiagnosticClassifiesWithoutPayload(t *testing.T) {
+	for _, tc := range []struct {
+		mode, class string
+		code        int
+	}{
+		{"fixture-fail", "exit", 9},
+		{"fixture-stderr-limit", "stderr_limit", -1},
+		{"fixture-data", "exit", 0},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			p, e := StartDaemon(context.Background(), testHelper(t), []string{"-test.run=^TestProcessFixture$", tc.mode})
+			if e != nil {
+				t.Fatal(e)
+			}
+			defer p.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			for {
+				_, e = p.Read(ctx, make([]byte, 64))
+				if e != nil {
+					break
+				}
+			}
+			status, ok := any(p).(interface{ ExitDiagnostic() (string, int) })
+			if !ok {
+				t.Fatal("process cannot distinguish nonzero exit from bounded diagnostic overflow")
+			}
+			class, code := status.ExitDiagnostic()
+			if class != tc.class || code != tc.code {
+				t.Fatalf("diagnostic %q/%d, want %q/%d", class, code, tc.class, tc.code)
+			}
+		})
+	}
 }

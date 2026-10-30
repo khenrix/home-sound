@@ -28,9 +28,9 @@ type Runtime struct {
 }
 
 func (r *Runtime) Errors() <-chan error { return r.errors }
-func (r *Runtime) fail() {
+func (r *Runtime) fail(class string, slot, exit int) {
 	select {
-	case r.errors <- errors.New("input runtime stopped; inspect private configuration and helper pins"):
+	case r.errors <- fmt.Errorf("input runtime stopped: %s slot=%d exit=%d", class, slot, exit):
 	default:
 	}
 	r.cancel()
@@ -132,7 +132,7 @@ func (r *Runtime) spotify(ctx context.Context, c Config, id Identity, n int, co 
 	admissions := spotify.NewAdmissions(ctx, co, id.Group, instance)
 	r.workers.Go(func() {
 		if admissions.Serve(ctx, admissionListener) != nil && ctx.Err() == nil {
-			r.fail()
+			r.fail("spotify_admission_listener", n, -1)
 		}
 	})
 	yaml := append(SpotifyYAML(id, socket, c.Spotify.Ports[n], c.Volume.Initial, c.Spotify.ZeroconfPorts[n]), []byte(fmt.Sprintf("framed_instance: %s\nframed_admission_socket: %s\nzeroconf_interfaces_to_advertise: [%s]\n", strconv.Quote(instance), strconv.Quote(admissionSocket), strconv.Quote(c.Interface)))...)
@@ -144,20 +144,7 @@ func (r *Runtime) spotify(ctx context.Context, c Config, id Identity, n int, co 
 		return e
 	}
 	r.closers = append(r.closers, process.Close)
-	r.workers.Go(func() {
-		b := make([]byte, 1024)
-		total := 0
-		for {
-			n, e := process.Read(ctx, b)
-			total += n
-			if e != nil || total > 4096 {
-				if ctx.Err() == nil {
-					r.fail()
-				}
-				return
-			}
-		}
-	})
+	r.workers.Go(func() { r.watchHelper(ctx, process, n) })
 	api := &spotify.API{Origin: fmt.Sprintf("http://127.0.0.1:%d", c.Spotify.Ports[n])}
 	ready := time.Now().Add(10 * time.Second)
 	for {
@@ -217,7 +204,7 @@ func (r *Runtime) spotify(ctx context.Context, c Config, id Identity, n int, co 
 			conn, e := listener.Accept()
 			if e != nil {
 				if ctx.Err() == nil {
-					r.fail()
+					r.fail("spotify_pcm_listener", n, -1)
 				}
 				return
 			}
@@ -299,7 +286,7 @@ func (r *Runtime) youtube(ctx context.Context, c Config, ids []Identity, co *sou
 		r.closers = append(r.closers, server.Close)
 		r.workers.Go(func() {
 			if server.Serve(listener) != http.ErrServerClosed && ctx.Err() == nil {
-				r.fail()
+				r.fail("youtube_http_listener", n, -1)
 			}
 		})
 		dials = append(dials, d)
@@ -313,7 +300,7 @@ func (r *Runtime) youtube(ctx context.Context, c Config, ids []Identity, co *sou
 	r.closers = append(r.closers, conn.Close)
 	r.workers.Go(func() {
 		if youtube.ServeDiscovery(ctx, conn, dials) != nil && ctx.Err() == nil {
-			r.fail()
+			r.fail("youtube_discovery", -1, -1)
 		}
 	})
 	r.workers.Go(func() {
@@ -342,3 +329,24 @@ func (r *Runtime) youtube(ctx context.Context, c Config, ids []Identity, co *sou
 func deploymentDecoderVersion(v string) bool { return v == "9.0.2" || v == "n9.0.2" }
 
 func spotifyArgs(dir string) []string { return []string{"--config_dir", dir} }
+
+func (r *Runtime) watchHelper(ctx context.Context, process *source.Process, slot int) {
+	b := make([]byte, 1024)
+	total := 0
+	for {
+		n, e := process.Read(ctx, b)
+		total += n
+		if e != nil || total > 4096 {
+			if ctx.Err() == nil {
+				class, exit := process.ExitDiagnostic()
+				if total > 4096 {
+					class, exit = "stdout_limit", -1
+				} else if class == "running" {
+					class = "read"
+				}
+				r.fail("spotify_"+class, slot, exit)
+			}
+			return
+		}
+	}
+}
