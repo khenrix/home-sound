@@ -208,7 +208,7 @@ func (r *chunkReader) read() (audio.Frame, error) {
 		if _, err := audio.SampleTime(r.next+chunkFrames, 48000); err != nil {
 			return audio.Frame{}, err
 		}
-		if err := r.session.engine.clock.WaitUntil(r.session.ctx, r.session.rawTime(r.next+chunkFrames)-sendAhead); err != nil {
+		if err := r.session.engine.clock.WaitUntil(r.session.ctx, r.session.rawTime(r.next+chunkFrames)-sendAhead+r.session.inputReserve); err != nil {
 			return audio.Frame{}, err
 		}
 		f, err := r.session.selection.Source.Read(r.session.ctx)

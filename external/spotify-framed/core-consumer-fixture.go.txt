@@ -1,0 +1,111 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Test-only overlay on the pinned corresponding source; never a production daemon.
+package player
+
+import (
+	"github.com/devgianlu/go-librespot/output"
+	"io"
+	"os"
+	"testing"
+	"time"
+)
+
+type coreSentinel struct {
+	value float32
+	title string
+}
+
+func (s *coreSentinel) Read(p []float32) (int, error) {
+	for i := range p {
+		p[i] = s.value
+	}
+	return len(p), nil
+}
+func (s *coreSentinel) SetPositionMs(int64) error { s.value = .5; return nil }
+func (*coreSentinel) PositionMs() int64           { return 0 }
+func (s *coreSentinel) FramedIdentity() string {
+	return `{"uri":"spotify:track:fixture","title":"` + s.title + `"}`
+}
+func TestCoreConsumerFixture(t *testing.T) {
+	path := os.Args[len(os.Args)-1]
+	s := NewSwitchingAudioSource(0)
+	s.SetPrimary(&coreSentinel{.25, "first"})
+	out, e := output.NewOutput(&output.NewOutputOptions{Backend: "framed", Reader: s, OutputPipe: path, SampleRate: 44100, ChannelCount: 2, ExternalVolume: true, VolumeUpdate: make(chan float32, 1)})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer out.Close()
+	if e = out.Resume(); e != nil {
+		t.Fatal(e)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if e = out.Drop(); e != nil {
+		t.Fatal(e)
+	}
+	if e = s.SetPositionMs(12000); e != nil {
+		t.Fatal(e)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if e = out.Resume(); e != nil {
+		t.Fatal(e)
+	}
+	time.Sleep(400 * time.Millisecond)
+	if e = out.Drop(); e != nil {
+		t.Fatal(e)
+	}
+	s.SetPrimary(&coreSentinel{.75, "second"})
+	if e = out.Resume(); e != nil {
+		t.Fatal(e)
+	}
+	time.Sleep(400 * time.Millisecond)
+}
+
+type coreFinite struct {
+	coreSentinel
+	remaining int
+}
+
+func (s *coreFinite) Read(p []float32) (int, error) {
+	n := len(p)
+	if n > s.remaining*2 {
+		n = s.remaining * 2
+	}
+	for i := 0; i < n; i++ {
+		p[i] = s.value
+	}
+	s.remaining -= n / 2
+	if s.remaining == 0 {
+		return n, io.EOF
+	}
+	return n, nil
+}
+func TestCorePrefetchFixture(t *testing.T) {
+	path := os.Args[len(os.Args)-1]
+	s := NewSwitchingAudioSource(0)
+	s.SetPrimary(&coreFinite{coreSentinel{.25, "first"}, 4411})
+	s.SetSecondary(&coreFinite{coreSentinel{.75, "second"}, 8819})
+	out, e := output.NewOutput(&output.NewOutputOptions{Backend: "framed", Reader: s, OutputPipe: path, SampleRate: 44100, ChannelCount: 2, ExternalVolume: true, VolumeUpdate: make(chan float32, 1)})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer out.Close()
+	if e = out.Resume(); e != nil {
+		t.Fatal(e)
+	}
+	time.Sleep(2 * time.Second)
+}
+
+func TestCoreSustainedFixture(t *testing.T) {
+	path := os.Args[len(os.Args)-1]
+	s := NewSwitchingAudioSource(0)
+	s.SetPrimary(&coreSentinel{.25, "sustained"})
+	out, e := output.NewOutput(&output.NewOutputOptions{Backend: "framed", Reader: s, OutputPipe: path, SampleRate: 44100, ChannelCount: 2, ExternalVolume: true, VolumeUpdate: make(chan float32, 1)})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer out.Close()
+	if e = out.Resume(); e != nil {
+		t.Fatal(e)
+	}
+	time.Sleep(2 * time.Second)
+}

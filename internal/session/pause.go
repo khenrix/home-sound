@@ -137,14 +137,14 @@ func (s *running) waitProduction(end uint64) error {
 				continue
 			}
 		}
-		at := s.rawTime(end) - sendAhead
+		at := s.rawTime(end) - sendAhead + s.inputReserve
 		if err := s.engine.clock.WaitUntil(s.ctx, at); err != nil {
 			return err
 		}
 		s.mu.Lock()
 		paused = s.paused
 		s.mu.Unlock()
-		if !paused && s.engine.clock.Now() >= s.rawTime(end)-sendAhead {
+		if !paused && s.engine.clock.Now() >= s.rawTime(end)-sendAhead+s.inputReserve {
 			return s.ctx.Err()
 		}
 	}

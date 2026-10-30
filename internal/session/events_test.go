@@ -2,6 +2,7 @@ package session
 
 import (
 	"testing"
+	"time"
 
 	"github.com/khenrix/home-sound/internal/airplay"
 	"github.com/khenrix/home-sound/internal/config"
@@ -39,4 +40,19 @@ func TestSourceEventsUpdateMetadataAndTransportWithoutChangingTimeline(t *testin
 	if e.Status().SourceTransport != "buffering" {
 		t.Fatal("unknown transport state accepted")
 	}
+}
+
+func TestSourceMetadataWaitsForContentBoundary(t *testing.T) {
+	e, c, _ := setup(t)
+	s := &eventSource{events: make(chan SourceEvent, 8)}
+	selectSource(t, e, config.AllSpeakers, s)
+	eventually(t, func() bool { return e.Status().NextSample >= 48000 })
+	sample := uint64(24000)
+	s.events <- SourceEvent{Kind: "metadata", Metadata: airplay.Metadata{Title: "next track"}, Sample: &sample}
+	time.Sleep(20 * time.Millisecond)
+	if e.Status().Metadata.Title == "next track" {
+		t.Fatal("metadata jumped ahead of content boundary")
+	}
+	c.advance(1500 * time.Millisecond)
+	eventually(t, func() bool { return e.Status().Metadata.Title == "next track" })
 }

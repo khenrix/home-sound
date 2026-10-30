@@ -18,6 +18,7 @@ import (
 
 	"github.com/khenrix/home-sound/internal/config"
 	"github.com/khenrix/home-sound/internal/control"
+	"github.com/khenrix/home-sound/internal/inputs"
 	"github.com/khenrix/home-sound/internal/session"
 	"github.com/khenrix/home-sound/internal/volume"
 )
@@ -25,6 +26,8 @@ import (
 func runService(args []string, out, errOut io.Writer) error {
 	flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	flags.SetOutput(errOut)
+	enableInputs := flags.Bool("enable-inputs", false, "explicitly start configured native input helpers and advertisements")
+	inputConfig := flags.String("inputs-config", "", "private input configuration")
 	socket := flags.String("socket", "", "absolute operator Unix socket path")
 	path := flags.String("config", "", "protected version 1 configuration file (serve)")
 	action := flags.String("action", "", "select, stop, pause, resume, target, mute or exclude (control)")
@@ -86,7 +89,38 @@ func runService(args []string, out, errOut io.Writer) error {
 		defer listener.Close()
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
-		return control.Serve(ctx, listener, service)
+		runtimeFailure := make(chan error, 1)
+		if *enableInputs {
+			if *inputConfig == "" {
+				return errors.New("enabled inputs require -inputs-config")
+			}
+			ic, e := inputs.Load(*inputConfig)
+			if e != nil {
+				return e
+			}
+			runtime, e := inputs.Start(ctx, ic, service.InputCoordinator(ic.Volume.Target), false)
+			if e != nil {
+				return e
+			}
+			defer runtime.Close()
+			go func() {
+				select {
+				case <-ctx.Done():
+				case e := <-runtime.Errors():
+					runtimeFailure <- e
+					cancel()
+				}
+			}()
+		} else if *inputConfig != "" {
+			return errors.New("input configuration requires explicit -enable-inputs")
+		}
+		e := control.Serve(ctx, listener, service)
+		select {
+		case failure := <-runtimeFailure:
+			return failure
+		default:
+			return e
+		}
 	}
 	method, endpoint := http.MethodGet, "/v1/status"
 	var body any

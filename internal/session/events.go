@@ -10,6 +10,7 @@ import (
 // Paused/playing transitions control the retained media timeline. Buffering is
 // informational; EOF/error and explicit new selections retain their own semantics.
 type SourceEvent struct {
+	Sample    *uint64
 	Kind      string
 	Metadata  airplay.Metadata
 	Transport string
@@ -24,6 +25,11 @@ func (s *running) sourceEvents(events <-chan SourceEvent) {
 		case event, ok := <-events:
 			if !ok || s.ctx.Err() != nil {
 				return
+			}
+			if event.Kind == "metadata" && event.Sample != nil {
+				if s.waitMetadata(*event.Sample) != nil {
+					return
+				}
 			}
 			if event.Kind == "transport" {
 				if event.Transport == "paused" {
@@ -58,6 +64,31 @@ func (s *running) sourceEvents(events <-chan SourceEvent) {
 				}
 			}
 			s.mu.Unlock()
+		}
+	}
+}
+
+func (s *running) waitMetadata(sample uint64) error {
+	for {
+		s.mu.Lock()
+		paused, changed := s.paused, s.changed
+		s.mu.Unlock()
+		if paused {
+			select {
+			case <-s.ctx.Done():
+				return s.ctx.Err()
+			case <-changed:
+				continue
+			}
+		}
+		if e := s.engine.clock.WaitUntil(s.ctx, s.rawTime(sample)); e != nil {
+			return e
+		}
+		s.mu.Lock()
+		paused = s.paused
+		s.mu.Unlock()
+		if !paused && s.engine.clock.Now() >= s.rawTime(sample) {
+			return s.ctx.Err()
 		}
 	}
 }

@@ -30,9 +30,11 @@ func main() {
 }
 func run(args []string, out, errOut io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: home-sound serve|control|status|profile|version|signal|inspect|record|analyze|discover|pair-lg|lg-status|lg-volume|pair-airplay|airplay-status|play")
+		return errors.New("usage: home-sound input-probe|serve|control|status|profile|version|signal|inspect|record|analyze|discover|pair-lg|lg-status|lg-volume|pair-airplay|airplay-status|play")
 	}
 	switch args[0] {
+	case "input-probe":
+		return runInputProbe(args[1:], out, errOut)
 	case "serve", "control", "status", "profile":
 		return runService(args, out, errOut)
 	case "discover", "pair-lg", "lg-status", "lg-volume", "pair-airplay", "airplay-status", "play":

@@ -11,6 +11,7 @@ import (
 
 	"github.com/khenrix/home-sound/internal/config"
 	"github.com/khenrix/home-sound/internal/session"
+	"github.com/khenrix/home-sound/internal/source"
 	"github.com/khenrix/home-sound/internal/volume"
 )
 
@@ -19,6 +20,7 @@ type Service struct {
 	path   string
 	cfg    config.Config
 	engine *session.Engine
+	inputs *source.Coordinator
 }
 
 func New(path string, c config.Config, m session.Mapping, f session.Factory) (*Service, error) {
@@ -125,6 +127,12 @@ type Command struct {
 }
 
 func (s *Service) control(c Command) error {
+	if s.inputs != nil && (c.Action == "select" || c.Action == "stop") {
+		return s.inputs.Exclusive(func() error { return s.controlEngine(c) })
+	}
+	return s.controlEngine(c)
+}
+func (s *Service) controlEngine(c Command) error {
 	switch c.Action {
 	case "select":
 		f, err := os.Open(c.Input)
@@ -152,10 +160,16 @@ func (s *Service) control(c Command) error {
 		if c.TargetDB == nil {
 			return errors.New("target_db required")
 		}
+		if s.inputs != nil {
+			return s.inputs.SetTargetDB(*c.TargetDB)
+		}
 		return s.engine.SetTargetDB(*c.TargetDB)
 	case "mute":
 		if c.Muted == nil {
 			return errors.New("muted required")
+		}
+		if s.inputs != nil {
+			return s.inputs.SetMuted(*c.Muted)
 		}
 		return s.engine.Mute(*c.Muted)
 	case "exclude":
@@ -166,4 +180,13 @@ func (s *Service) control(c Command) error {
 	default:
 		return errors.New("unknown control action")
 	}
+}
+
+func (s *Service) InputCoordinator(policy func(int) (float64, error)) *source.Coordinator {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inputs == nil {
+		s.inputs = source.NewCoordinator(s.engine, policy)
+	}
+	return s.inputs
 }

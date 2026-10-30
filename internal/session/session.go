@@ -119,6 +119,7 @@ type running struct {
 	epoch                     uint64
 	selection                 Selection
 	origin                    time.Duration
+	inputReserve              time.Duration
 	ctx                       context.Context
 	cancel                    context.CancelFunc
 	recovery                  context.Context
@@ -168,6 +169,14 @@ func (e *Engine) Select(sel Selection) (uint64, error) {
 	if sel.Source == nil || sel.Source.Format() != audio.Canonical {
 		return 0, errors.New("canonical source required")
 	}
+	var reserve time.Duration
+	if b, ok := sel.Source.(interface{ BufferedSamples() uint64 }); ok {
+		n := b.BufferedSamples()
+		if n > 96000 {
+			return 0, errors.New("input buffering exceeds two seconds")
+		}
+		reserve = time.Duration(n) * time.Second / 48000
+	}
 	ids, ok := e.cfg.Groups[sel.Group]
 	if !ok {
 		return 0, errors.New("unknown destination")
@@ -214,7 +223,7 @@ func (e *Engine) Select(sel Selection) (uint64, error) {
 		v := *sel.TVCalibration
 		sel.TVCalibration = &v
 	}
-	s := &running{paused: true, resuming: true, pausedSample: sel.FirstSample, resumeFloor: sel.FirstSample, engine: e, epoch: e.epoch, selection: sel, origin: e.clock.Now() + time.Second - firstTime, ctx: ctx, cancel: cancel, recovery: recovery, cancelRecovery: cancelRecovery, done: make(chan struct{}), members: map[string]*member{}, next: sel.FirstSample, sourceState: "reading", metadata: sel.Source.Metadata(), active: true, changed: make(chan struct{})}
+	s := &running{inputReserve: reserve, paused: true, resuming: true, pausedSample: sel.FirstSample, resumeFloor: sel.FirstSample, engine: e, epoch: e.epoch, selection: sel, origin: e.clock.Now() + time.Second - firstTime, ctx: ctx, cancel: cancel, recovery: recovery, cancelRecovery: cancelRecovery, done: make(chan struct{}), members: map[string]*member{}, next: sel.FirstSample, sourceState: "reading", metadata: sel.Source.Metadata(), active: true, changed: make(chan struct{})}
 	for _, id := range ids {
 		m := &member{id: id, plan: plans[id], wake: make(chan struct{}, 1), state: MemberStatus{State: "preparing", Audibility: "unverified", UnderrunEvidence: "not_reported_by_adapter"}, feedback: volume.NewFeedback(e.cfg.Profiles[id], e.cfg.Devices[id].RoomTrimDB)}
 		s.members[id] = m
