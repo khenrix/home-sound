@@ -68,3 +68,48 @@ func TestDIALRejectMalformedLaunch(t *testing.T) {
 		t.Fatal("accepted malformed SSDP")
 	}
 }
+
+// Chromium DialURLFetcher::Start attaches URL-encoded launch data with
+// AttachStringForUpload(..., "text/plain"), rather than a form MIME type.
+func TestDIALChromiumPlainTextLaunch(t *testing.T) {
+	for _, contentType := range []string{"text/plain", "text/plain; charset=UTF-8", "application/x-www-form-urlencoded"} {
+		t.Run(contentType, func(t *testing.T) {
+			app := &dialApp{}
+			d, e := NewDIAL(config.AllSpeakers, "00000000-0000-0000-0000-000000000001", "http://127.0.0.1:8008", app)
+			if e != nil {
+				t.Fatal(e)
+			}
+			r := httptest.NewRequest(http.MethodPost, "http://local/apps/YouTube", strings.NewReader("pairingCode=fixture%2Dcode&theme=cl"))
+			r.Header.Set("Content-Type", contentType)
+			w := httptest.NewRecorder()
+			d.ServeHTTP(w, r)
+			if w.Code != http.StatusCreated || w.Header().Get("Location") != "http://127.0.0.1:8008/apps/YouTube/run" || !app.Running() || app.code != "fixture-code" {
+				t.Fatalf("native launch was not admitted: status=%d running=%t", w.Code, app.Running())
+			}
+		})
+	}
+}
+
+func TestDIALPlainTextRetainsLaunchValidation(t *testing.T) {
+	for _, tc := range []struct{ contentType, body string }{
+		{"text/plain", "theme=cl"},
+		{"text/plain; charset=UTF-8", "pairingCode=x&theme=wrong"},
+		{"text/plain", "pairingCode=x&pairingCode=y&theme=cl"},
+		{"text/plain", "pairingCode=x&theme=cl&theme=cl"},
+		{"text/plain", "pairingCode=%ff&theme=cl"},
+		{"text/plain", "pairingCode=bad%0Avalue&theme=cl"},
+		{"text/plain", "pairingCode=x&theme=cl&padding=" + strings.Repeat("x", 2048)},
+		{"application/json", "pairingCode=x&theme=cl"},
+		{"text/plain; charset=", "pairingCode=x&theme=cl"},
+	} {
+		app := &dialApp{}
+		d, _ := NewDIAL(config.AllSpeakers, "00000000-0000-0000-0000-000000000001", "http://127.0.0.1:8008", app)
+		r := httptest.NewRequest(http.MethodPost, "http://local/apps/YouTube", strings.NewReader(tc.body))
+		r.Header.Set("Content-Type", tc.contentType)
+		w := httptest.NewRecorder()
+		d.ServeHTTP(w, r)
+		if w.Code != http.StatusBadRequest || app.Running() {
+			t.Errorf("malformed launch admitted: status=%d", w.Code)
+		}
+	}
+}

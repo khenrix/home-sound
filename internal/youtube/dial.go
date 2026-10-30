@@ -65,7 +65,7 @@ func (d *DIAL) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `<?xml version="1.0"?><service xmlns="urn:dial-multiscreen-org:schemas:dial" dialVer="1.7"><name>YouTube</name><options allowStop="true"/><state>%s</state>%s</service>`, state, link)
 	case "POST /apps/YouTube":
 		content, _, e := mime.ParseMediaType(r.Header.Get("Content-Type"))
-		if e != nil || content != "application/x-www-form-urlencoded" {
+		if e != nil || content != "application/x-www-form-urlencoded" && content != "text/plain" {
 			http.Error(w, "invalid launch content type", 400)
 			return
 		}
