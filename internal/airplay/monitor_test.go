@@ -25,6 +25,7 @@ func TestNativeLGPeriodicReadbackFailure(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 			defer cancel()
 			readback := make(chan struct{}, 1)
+			releaseFailure := make(chan struct{})
 			closed := make(chan struct{})
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				defer close(closed)
@@ -72,6 +73,11 @@ func TestNativeLGPeriodicReadbackFailure(t *testing.T) {
 									select {
 									case readback <- struct{}{}:
 									default:
+									}
+									select {
+									case <-releaseFailure:
+									case <-ctx.Done():
+										return
 									}
 								}
 								switch mode {
@@ -133,31 +139,35 @@ func TestNativeLGPeriodicReadbackFailure(t *testing.T) {
 			if err = o.Write(ctx, audio.Frame{Epoch: 3, Data: []float32{.1, .1}}); err != nil {
 				t.Fatal(err)
 			}
-			failureBound := 3500 * time.Millisecond
+			failureDeadline := time.Now().Add(3500 * time.Millisecond)
+			requestBound := time.Until(failureDeadline)
 			if mode == "event_during_readback" {
-				select {
-				case <-readback:
-				case <-time.After(2 * time.Second):
-					t.Fatal("no native readback request")
-				}
+				requestBound = 2 * time.Second
+			}
+			select {
+			case <-readback:
+			case <-time.After(requestBound):
+				t.Fatal("no native readback request")
+			}
+			// Establish liveness before releasing the unsafe response. The
+			// failure cancels pending I/O and may legitimately close the socket.
+			select {
+			case <-closed:
+				t.Fatal("fixture connection closed before injecting native failure")
+			default:
+			}
+			if s := o.Status(); !s.Healthy || !s.Ready {
+				t.Fatal("adapter failed before native fault was injected")
+			}
+			close(releaseFailure)
+			failureBound := time.Until(failureDeadline)
+			if mode == "event_during_readback" {
 				failureBound = 500 * time.Millisecond
 			}
 			select {
 			case <-o.done:
 			case <-time.After(failureBound):
 				t.Fatalf("native %s control left helper running: %+v", mode, o.Status())
-			}
-			if mode != "event_during_readback" {
-				select {
-				case <-readback:
-				default:
-					t.Fatal("adapter stopped without a periodic native volume request")
-				}
-			}
-			select {
-			case <-closed:
-				t.Fatal("fixture connection closed before liveness failure was established")
-			default:
 			}
 			if s := o.Status(); s.Healthy || s.Ready {
 				t.Fatalf("failed native control retained readiness: %+v", s)
