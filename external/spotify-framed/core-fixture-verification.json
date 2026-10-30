@@ -2,9 +2,9 @@
   "purpose": "Separate GPL actual native-command/admission/switching-source/output test overlay; no production daemon execution",
   "source_commit": "90a4fdaf0314269e3fa25698a5f4270c026d2c03",
   "production_patch_sha256": "b82b83a5231a80f00999c7182988ef5d190385d2774c14df432da115225170a6",
-  "production_binary_sha256": "14709a9427a39ad6bea246d8103c839f6ad38cd76eac2153a756e4d18cbb90fb",
-  "fixture_source_sha256": "e4388a2e69992736abc4a3e403611c96b378438295b0eb0f0fe5d9429549b384",
-  "observed_fixture_binary_sha256": "520f73709b1684397dd47aa300c5d54e2e2f7e48015fd7c0b65fe2315518fec9",
+  "production_binary_sha256": "59f86151e38c11d5d10a70127d1140d30e14f7d8c78ceae2f92a7741344bf8c1",
+  "fixture_source_sha256": "cae67316f28a9bcb5d00463861d9cbe36b2adc9767e31d5adf6e82b73a0eb33d",
+  "observed_fixture_binary_sha256": "ec55592975d69fe44641ac7baf7588b62a30e35c37ef6be6f6faa95d2768489a",
   "toolchain": "go1.27.3 linux/amd64",
   "build": "go test -race -tags test_unit -overlay <generated mapping> -c ./daemon",
   "native_dependencies": "build-dependencies.json",
@@ -12,7 +12,19 @@
     "TestActualPatchedHelperToCoreSubprocess",
     "TestActualPrefetchKeepsEngineOutputsAndConverter",
     "TestActualHelperSustainsRealtimeWithBoundedCredit",
-    "TestActualNativeQueuedTransferRevokedAndFreshRecast"
+    "TestActualNativeQueuedTransferRevokedAndFreshRecast",
+    "TestActualNativeVorbisRetirementAndFreshRecast"
   ],
-  "native_acceptance": false
+  "native_acceptance": false,
+  "production_native_decoder_patch_sha256": "78bedaec1e96294641c3eb5b8f6d018b2e717157463627d7e34fea4e100cc172",
+  "native_fixture_sha256": "d4006273e8cf236f85d8d762701038e94cb9af811764fe1eeaa746be4cdc8547",
+  "native_decoder_integration": "real 44100 Hz stereo Vorbis -> real Player -> framed output -> core observer; revoke, retire decoder, fresh owner PCM, clean process exit",
+  "core_scoped_base": "10004eb0f4b3ccd240a20c1e511cc2ef82156fab",
+  "core_race_test_results": {
+    "run": 311,
+    "pass": 311,
+    "skip": 0,
+    "fail": 0
+  },
+  "native_core_mutation": "old cleanup only, via Go overlay: native retirement/recast integration fails; fixed cleanup passes race count=10"
 }

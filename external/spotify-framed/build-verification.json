@@ -3,8 +3,8 @@
   "release": "v0.10.5",
   "commit": "90a4fdaf0314269e3fa25698a5f4270c026d2c03",
   "patch_sha256": "b82b83a5231a80f00999c7182988ef5d190385d2774c14df432da115225170a6",
-  "binary_sha256": "14709a9427a39ad6bea246d8103c839f6ad38cd76eac2153a756e4d18cbb90fb",
-  "reproduction_binary_sha256": "14709a9427a39ad6bea246d8103c839f6ad38cd76eac2153a756e4d18cbb90fb",
+  "binary_sha256": "59f86151e38c11d5d10a70127d1140d30e14f7d8c78ceae2f92a7741344bf8c1",
+  "reproduction_binary_sha256": "59f86151e38c11d5d10a70127d1140d30e14f7d8c78ceae2f92a7741344bf8c1",
   "toolchain": "go1.27.3",
   "goos": "linux",
   "goarch": "amd64",
@@ -23,5 +23,23 @@
   "binary_execution": "not launched as a daemon; controlled helper package subprocess fixtures only",
   "hardware_acceptance": "unverified",
   "protocol_version": 2,
-  "verification_date": "2026-10-30"
+  "verification_date": "2026-10-30",
+  "previous_binary_sha256": "14709a9427a39ad6bea246d8103c839f6ad38cd76eac2153a756e4d18cbb90fb",
+  "patches": [
+    {
+      "file": "framed.patch",
+      "sha256": "b82b83a5231a80f00999c7182988ef5d190385d2774c14df432da115225170a6"
+    },
+    {
+      "file": "native-decoder.patch",
+      "sha256": "78bedaec1e96294641c3eb5b8f6d018b2e717157463627d7e34fea4e100cc172"
+    }
+  ],
+  "native_decoder_patch_sha256": "78bedaec1e96294641c3eb5b8f6d018b2e717157463627d7e34fea4e100cc172",
+  "native_fixture_sha256": "d4006273e8cf236f85d8d762701038e94cb9af811764fe1eeaa746be4cdc8547",
+  "corresponding_source_tar_sha256": "e53cbab3cae887c35f443799e1266078d8f00ce46e0020cff243b2903f827bd6",
+  "source_file_manifest_sha256": "7334d8e72b2ad613c006a3d7cb7177a8a2ab28cc89a0dc3c793fbe1f089ccdb1",
+  "source_archive_format": "PAX tar; lexicographically sorted git ls-files -co --exclude-standard entries; uid/gid/mtime=0; empty uname/gname; relative paths; no .git",
+  "source_files": 305,
+  "native_cleanup": "block before DSP before codec info; partial initialization guards retained"
 }

@@ -115,6 +115,19 @@ func TestActualHelperSustainsRealtimeWithBoundedCredit(t *testing.T) {
 }
 
 func TestActualNativeQueuedTransferRevokedAndFreshRecast(t *testing.T) {
+	actualNativeRecast(t, "TestCoreNativeRecastFixture", "")
+}
+
+func TestActualNativeVorbisRetirementAndFreshRecast(t *testing.T) {
+	fixture, err := filepath.Abs("../../external/spotify-framed/native-decoder-tone.ogg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualNativeRecast(t, "TestCoreNativeVorbisRecastFixture", fixture)
+}
+
+func actualNativeRecast(t *testing.T, fixtureTest, tone string) {
+	t.Helper()
 	path := os.Getenv("HOME_SOUND_FRAMED_FIXTURE")
 	if path == "" {
 		t.Skip("explicit separately built GPL source fixture required")
@@ -142,7 +155,11 @@ func TestActualNativeQueuedTransferRevokedAndFreshRecast(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer controlListener.Close()
-	proc, e := source.StartProcess(ctx, source.Helper{Path: path, SHA256: hex.EncodeToString(sum[:])}, []string{"-test.run=^TestCoreNativeRecastFixture$", pcmPath, admissionSocket, testInstance, controlPath}, 6*time.Second)
+	args := []string{"-test.run=^" + fixtureTest + "$", pcmPath, admissionSocket, testInstance, controlPath}
+	if tone != "" {
+		args = append(args, tone)
+	}
+	proc, e := source.StartProcess(ctx, source.Helper{Path: path, SHA256: hex.EncodeToString(sum[:])}, args, 6*time.Second)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -180,6 +197,24 @@ func TestActualNativeQueuedTransferRevokedAndFreshRecast(t *testing.T) {
 	}
 	leases, done := accept()
 	first := await(leases, done)
+	awaitPCM := func(title string) {
+		if tone == "" {
+			return
+		}
+		deadline := time.After(time.Second)
+		for {
+			observed := o.Snapshot()
+			if observed.Metadata.Title == title && observed.Frames >= 960 && observed.Peak > 0 {
+				return
+			}
+			select {
+			case <-deadline:
+				t.Fatal("native Vorbis PCM did not reach core")
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}
+	awaitPCM("first")
 	owner, e := co.Reserve(source.Identity{Provider: "youtube", Group: "TV + All Speakers", Instance: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Generation: 1}, nil)
 	if e != nil {
 		t.Fatal(e)
@@ -203,10 +238,27 @@ func TestActualNativeQueuedTransferRevokedAndFreshRecast(t *testing.T) {
 	if second.Epoch <= owner.Epoch || second.Instance == first.Instance || !co.Current(second) {
 		t.Fatal("fresh native recast did not reopen/select")
 	}
+	awaitPCM("second")
 	control.Write([]byte{'Q'})
 	select {
 	case <-done:
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
+	}
+	if tone != "" {
+		buf := make([]byte, 256)
+		for {
+			_, err := proc.Read(ctx, buf)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				class, code := proc.ExitDiagnostic()
+				t.Fatalf("native retirement helper did not exit cleanly: %s/%d", class, code)
+			}
+		}
+		if class, code := proc.ExitDiagnostic(); class != "exit" || code != 0 {
+			t.Fatalf("native retirement helper exit: %s/%d", class, code)
+		}
 	}
 }

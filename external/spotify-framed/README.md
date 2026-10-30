@@ -32,7 +32,8 @@ GO_BINARY=/absolute/go/bin/go external/spotify-framed/build.sh \
 `PKG_CONFIG`, `PKG_CONFIG_SYSROOT_DIR`, `PKG_CONFIG_PATH` and
 `LD_LIBRARY_PATH` may point at a private extracted distro sysroot. The script
 checks patch hashes, acquires canonical corresponding source, applies the
-patch, runs uncached upstream unit tests with race detection, vets and builds.
+framed patch followed by the native decoder patch and copies the pinned synthetic
+tone fixture, runs uncached upstream unit tests with race detection, vets and builds.
 It never installs, starts, advertises or authenticates. `build-dependencies.json`
 records the exact Ubuntu archive artifacts used for local verification; their
 copyright notices are retained under the extracted sysroot's `usr/share/doc`.
@@ -42,9 +43,49 @@ When distributing a helper binary, supply the complete patched corresponding
 source, this patch, build configuration, upstream and dependency notices, and
 GPL license. A process boundary is an engineering separation, not a legal
 claim about arbitrary combined distributions. The generated binary hash and
-actual build information must accompany deployment. No binary is committed. `build-verification.json` records the current patch,
+actual build information must accompany deployment. No binary is committed. `build-verification.json` records the current patches,
 source pin, toolchain, native dependency manifest and independently reproduced
 binary hashes; it is software build evidence, not live acceptance.
+
+## Native Vorbis decoder cleanup
+
+Apply `native-decoder.patch` after the unchanged protocol-v2 `framed.patch`.
+The upstream release and its Go/native dependency pins are unchanged. The only
+additional production change tears down block state, then DSP state, then codec
+info, retaining the existing nil-reference guards. libvorbis DSP teardown reads
+`vorbis_info` and its codec setup; clearing/freeing that info first leaves a
+dangling C pointer. The matching canonical [libvorbis v1.3.7 source](https://github.com/xiph/vorbis/blob/v1.3.7/lib/block.c)
+and [reference decoder](https://github.com/xiph/vorbis/blob/v1.3.7/examples/decoder_example.c)
+show the dependency and teardown order.
+
+The patch includes actual native decoder Close-after-Read and Close-before-Read
+checks, repeated Close and rejected Read-after-Close, invalid/partial-header
+cleanup, and real player peer revocation/session retirement followed by a fresh
+player owner. The separate core fixture also decodes non-silent native PCM on
+both sides of a revoked owner, rejects a stale native command, and requires a
+clean helper exit after both decoders retire. These fixtures never start a
+production daemon, advertise, authenticate, or access an account. Core Go APIs
+and wire protocol v2 are unchanged. This establishes the local cleanup fix;
+live Spotify handoff acceptance remains separate.
+
+`native-decoder-tone.ogg` is a newly synthesized 440 Hz tone, five seconds,
+44100 Hz stereo Vorbis, distributed under this directory's GPL license. It
+contains no account data or recording. Generated with Ubuntu's FFmpeg
+8.0.1-3ubuntu2; this command was rerun and produced the identical SHA-256 in
+`SHA256SUMS`:
+
+```sh
+ffmpeg -hide_banner -loglevel error -f lavfi \
+  -i sine=frequency=440:sample_rate=44100:duration=5 -ac 2 \
+  -c:a libvorbis -q:a 4 -map_metadata -1 \
+  -fflags +bitexact -flags:a +bitexact native-decoder-tone.ogg
+```
+
+The build copies it to `vorbis/testdata/close-tone.ogg`. Both clean builds
+produced binary SHA-256 `59f86151e38c11d5d10a70127d1140d30e14f7d8c78ceae2f92a7741344bf8c1`.
+The matching corresponding-source archive hash and deterministic archive recipe
+are recorded in `build-verification.json`. The previous helper artifact is
+retained separately; no deployment is implied by changing this build pin.
 
 ## Protocol version 2
 

@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	librespot "github.com/devgianlu/go-librespot"
@@ -10,6 +11,7 @@ import (
 	"github.com/devgianlu/go-librespot/output"
 	"github.com/devgianlu/go-librespot/player"
 	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
+	nativevorbis "github.com/devgianlu/go-librespot/vorbis"
 	"io"
 	"net"
 	"os"
@@ -142,8 +144,23 @@ func fixtureSource(src librespot.AudioSource, title, grant, instance string) lib
 	return stream.FramedSource(src)
 }
 
-func TestCoreNativeRecastFixture(t *testing.T) {
-	args := os.Args[len(os.Args)-4:]
+func TestCoreNativeRecastFixture(t *testing.T)       { coreNativeRecastFixture(t, false) }
+func TestCoreNativeVorbisRecastFixture(t *testing.T) { coreNativeRecastFixture(t, true) }
+
+// The adapter only gives the native decoder the AudioSource Close signature.
+type coreVorbis struct {
+	*nativevorbis.Decoder
+	closed chan struct{}
+}
+
+func (s *coreVorbis) Close() error { s.Decoder.Close(); close(s.closed); return nil }
+
+func coreNativeRecastFixture(t *testing.T, native bool) {
+	count := 4
+	if native {
+		count++
+	}
+	args := os.Args[len(os.Args)-count:]
 	p := newTestAppPlayer(t)
 	p.ctx = context.Background()
 	p.app.cfg = &Config{AudioBackend: "framed", FramedAdmissionSocket: args[1], FramedInstance: args[2]}
@@ -160,7 +177,40 @@ func TestCoreNativeRecastFixture(t *testing.T) {
 	}
 	defer control.Close()
 	control.SetDeadline(time.Now().Add(4 * time.Second))
+	var retire func()
 	start := func(title string) output.Output {
+		if native {
+			data, err := os.ReadFile(args[4])
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoder, err := nativevorbis.New(&librespot.NullLogger{}, bytes.NewReader(data), nil, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decoder.SampleRate != 44100 || decoder.Channels != 2 {
+				t.Fatal("native fixture format")
+			}
+			src := &coreVorbis{Decoder: decoder, closed: make(chan struct{})}
+			pl, err := player.NewPlayer(&player.Options{Log: &librespot.NullLogger{}, AudioBackend: "framed", AudioOutputPipe: args[0], ExternalVolume: true, VolumeUpdate: make(chan float32, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = pl.SetPrimaryStream(fixtureSource(src, title, p.framedGrant, args[2]), false, true); err != nil {
+				t.Fatal(err)
+			}
+			retire = func() {
+				pl.Stop()
+				pl.Close()
+				select {
+				case <-src.closed:
+				case <-time.After(time.Second):
+					t.Fatal("native decoder retirement did not finish")
+				}
+			}
+			t.Cleanup(func() { pl.Close() })
+			return nil
+		}
 		s := player.NewSwitchingAudioSource(0)
 		s.SetPrimary(fixtureSource(&coreSentinel{.25, title, p.framedGrant, args[2]}, title, p.framedGrant, args[2]))
 		out, e := output.NewOutput(&output.NewOutputOptions{Backend: "framed", Reader: s, OutputPipe: args[0], SampleRate: 44100, ChannelCount: 2, ExternalVolume: true, VolumeUpdate: make(chan float32, 1)})
@@ -173,10 +223,16 @@ func TestCoreNativeRecastFixture(t *testing.T) {
 		return out
 	}
 	first := start("first")
-	defer first.Close()
+	if first != nil {
+		defer first.Close()
+	}
 	var signal [1]byte
 	if _, e = io.ReadFull(control, signal[:]); e != nil {
 		t.Fatal(e)
+	}
+	// Revocation has closed the old PCM peer before session retirement.
+	if native {
+		retire()
 	}
 	if e = p.handlePlayerCommand(old); e == nil {
 		t.Fatal("queued native handler re-acquired revoked source")
@@ -192,8 +248,13 @@ func TestCoreNativeRecastFixture(t *testing.T) {
 		t.Fatal(e)
 	}
 	second := start("second")
-	defer second.Close()
+	if second != nil {
+		defer second.Close()
+	}
 	if _, e = io.ReadFull(control, signal[:]); e != nil {
 		t.Fatal(e)
+	}
+	if native {
+		retire()
 	}
 }

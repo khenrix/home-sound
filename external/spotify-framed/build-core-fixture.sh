@@ -7,7 +7,11 @@ source_dir=${1:?patched corresponding source required}
 binary=${2:?absolute fixture binary path required}
 go_binary=${GO_BINARY:-go}
 test "$(git -C "$source_dir" rev-parse HEAD)" = 90a4fdaf0314269e3fa25698a5f4270c026d2c03
+cd "$here"
+sha256sum -c SHA256SUMS
 git -C "$source_dir" apply --reverse --check "$here/framed.patch"
+git -C "$source_dir" apply --reverse --check "$here/native-decoder.patch"
+cmp "$here/native-decoder-tone.ogg" "$source_dir/vorbis/testdata/close-tone.ogg"
 overlay="${binary}.overlay.json"
 python3 - "$source_dir" "$here" "$overlay" <<'PY'
 import json,sys

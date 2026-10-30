@@ -1,0 +1,266 @@
+diff --git a/player/framed_vorbis_close_test.go b/player/framed_vorbis_close_test.go
+new file mode 100644
+index 0000000..7e75803
+--- /dev/null
++++ b/player/framed_vorbis_close_test.go
+@@ -0,0 +1,136 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++package player
++
++import (
++	"bytes"
++	"encoding/binary"
++	"encoding/json"
++	librespot "github.com/devgianlu/go-librespot"
++	nativevorbis "github.com/devgianlu/go-librespot/vorbis"
++	"io"
++	"net"
++	"os"
++	"path/filepath"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++type closingVorbis struct {
++	*nativevorbis.Decoder
++	closed     chan struct{}
++	closeCount atomic.Int32
++}
++
++func (s *closingVorbis) FramedIdentity() string { return `{"uri":"synthetic-vorbis"}` }
++func (s *closingVorbis) Close() error {
++	s.Decoder.Close()
++	if s.closeCount.Add(1) == 1 {
++		close(s.closed)
++	}
++	return nil
++}
++
++func TestFramedVorbisRevocationAndSessionRetirement(t *testing.T) {
++	data, err := os.ReadFile("../vorbis/testdata/close-tone.ogg")
++	if err != nil {
++		t.Fatal(err)
++	}
++	path := filepath.Join(t.TempDir(), "pcm.sock")
++	listener, err := net.Listen("unix", path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	for owner := 0; owner < 2; owner++ {
++		decoder, err := nativevorbis.New(&librespot.NullLogger{}, bytes.NewReader(data), nil, 1)
++		if err != nil {
++			t.Fatal(err)
++		}
++		source := &closingVorbis{Decoder: decoder, closed: make(chan struct{})}
++		logger := &decoderRetirementLogger{}
++		p, err := NewPlayer(&Options{Log: logger, AudioBackend: "framed", AudioOutputPipe: path, ExternalVolume: true, VolumeUpdate: make(chan float32, 1)})
++		if err != nil {
++			t.Fatal(err)
++		}
++		if err = p.SetPrimaryStream(source, false, true); err != nil {
++			t.Fatal(err)
++		}
++		listener.(*net.UnixListener).SetDeadline(time.Now().Add(time.Second))
++		c, err := listener.Accept()
++		if err != nil {
++			t.Fatal(err)
++		}
++		c.SetDeadline(time.Now().Add(time.Second))
++		if _, err = c.Write([]byte{1}); err != nil {
++			t.Fatal(err)
++		}
++		var prefix [4]byte
++		if _, err = io.ReadFull(c, prefix[:]); err != nil {
++			t.Fatal(err)
++		}
++		n := binary.BigEndian.Uint32(prefix[:])
++		if n == 0 || n > 32768 {
++			t.Fatal("invalid framed record")
++		}
++		body := make([]byte, n)
++		if _, err = io.ReadFull(c, body); err != nil {
++			t.Fatal(err)
++		}
++		var record struct {
++			Rate, Channels int
++			PCM            []byte
++		}
++		if err = json.Unmarshal(body, &record); err != nil {
++			t.Fatal(err)
++		}
++		if record.Rate != 44100 || record.Channels != 2 || len(record.PCM) != 882*2*4 {
++			t.Fatalf("native PCM missing: rate=%d channels=%d bytes=%d", record.Rate, record.Channels, len(record.PCM))
++		}
++		nonzero := false
++		for _, b := range record.PCM {
++			if b != 0 {
++				nonzero = true
++				break
++			}
++		}
++		if !nonzero {
++			t.Fatal("native PCM was silent")
++		}
++		c.Close()
++		deadline := time.After(time.Second)
++		stopped := false
++		for !stopped {
++			select {
++			case event := <-p.Receive():
++				stopped = event.Type == EventTypeStop && event.Err != nil
++			case <-deadline:
++				t.Fatal("revocation did not stop output")
++			}
++		}
++		// A transfer with zeroconf enabled stops playback, then retires the old
++		// AppPlayer/session. Retirement closes SwitchingAudioSource and its decoder.
++		p.Stop()
++		p.Close()
++		select {
++		case <-source.closed:
++		case <-time.After(time.Second):
++			t.Fatal("retired decoder did not close")
++		}
++		if got := source.closeCount.Load(); got != 1 {
++			t.Fatalf("decoder close count %d", got)
++		}
++		if got := logger.errors.Load(); got != 1 {
++			t.Fatalf("output error count %d", got)
++		}
++	}
++}
++
++type decoderRetirementLogger struct {
++	librespot.NullLogger
++	errors atomic.Int32
++}
++
++func (l *decoderRetirementLogger) WithError(error) librespot.Logger { return l }
++func (l *decoderRetirementLogger) Errorf(string, ...interface{})    { l.errors.Add(1) }
++func (l *decoderRetirementLogger) Error(...interface{})             { l.errors.Add(1) }
+diff --git a/vorbis/close_lifecycle_test.go b/vorbis/close_lifecycle_test.go
+new file mode 100644
+index 0000000..b2dcc6f
+--- /dev/null
++++ b/vorbis/close_lifecycle_test.go
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++package vorbis
++
++import (
++	"bytes"
++	"os"
++	"testing"
++
++	librespot "github.com/devgianlu/go-librespot"
++)
++
++func TestActualDecoderCloseAfterRead(t *testing.T) {
++	data, err := os.ReadFile("testdata/close-tone.ogg")
++	if err != nil {
++		t.Fatal(err)
++	}
++	for i := 0; i < 100; i++ {
++		d, err := New(&librespot.NullLogger{}, bytes.NewReader(data), nil, 1)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if d.SampleRate != 44100 || d.Channels != 2 {
++			t.Fatalf("unexpected fixture format: %d/%d", d.SampleRate, d.Channels)
++		}
++		pcm := make([]float32, 1920)
++		n, err := d.Read(pcm)
++		if err != nil || n != len(pcm) {
++			t.Fatalf("read %d: %d %v", i, n, err)
++		}
++		nonzero := false
++		for _, v := range pcm {
++			if v != 0 {
++				nonzero = true
++				break
++			}
++		}
++		if !nonzero {
++			t.Fatal("fixture decoded only silence")
++		}
++		d.Close()
++		d.Close()
++		if n, err := d.Read(pcm); n != 0 || err == nil {
++			t.Fatalf("read after close: %d %v", n, err)
++		}
++	}
++}
++
++func TestActualDecoderCloseBeforeRead(t *testing.T) {
++	data, err := os.ReadFile("testdata/close-tone.ogg")
++	if err != nil {
++		t.Fatal(err)
++	}
++	for i := 0; i < 100; i++ {
++		d, err := New(&librespot.NullLogger{}, bytes.NewReader(data), nil, 1)
++		if err != nil {
++			t.Fatal(err)
++		}
++		// DSP exists but no block has been initialized by Read yet.
++		d.Close()
++		d.Close()
++	}
++}
++
++func TestActualDecoderHeaderFailureCleanup(t *testing.T) {
++	data, err := os.ReadFile("testdata/close-tone.ogg")
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, tc := range []struct {
++		name string
++		data []byte
++	}{
++		{"empty", nil},
++		{"not_ogg", bytes.Repeat([]byte{0x42}, 4096)},
++		// Only the identification page survives; the secondary headers are gone.
++		{"secondary_headers_missing", append(append([]byte(nil), data[:58]...), make([]byte, 4096-58)...)},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			for i := 0; i < 100; i++ {
++				d, err := New(&librespot.NullLogger{}, bytes.NewReader(tc.data), nil, 1)
++				if err == nil || d != nil {
++					t.Fatal("invalid headers accepted")
++				}
++			}
++		})
++	}
++}
+diff --git a/vorbis/decoder.go b/vorbis/decoder.go
+index 9dc706d..f860fb7 100644
+--- a/vorbis/decoder.go
++++ b/vorbis/decoder.go
+@@ -139,9 +139,10 @@ func (d *Decoder) decoderStateCleanup() {
+ 		d.comment.Free()
+ 	}
+ 
+-	if d.info.Ref() != nil {
+-		vorbis.InfoClear(&d.info)
+-		d.info.Free()
++	// DSP cleanup reads the codec info; release dependents before their owner.
++	if d.block.Ref() != nil {
++		vorbis.BlockClear(&d.block)
++		d.block.Free()
+ 	}
+ 
+ 	if d.dspState.Ref() != nil {
+@@ -149,9 +150,9 @@ func (d *Decoder) decoderStateCleanup() {
+ 		d.dspState.Free()
+ 	}
+ 
+-	if d.block.Ref() != nil {
+-		vorbis.BlockClear(&d.block)
+-		d.block.Free()
++	if d.info.Ref() != nil {
++		vorbis.InfoClear(&d.info)
++		d.info.Free()
+ 	}
+ 
+ 	d.packet.Free()

@@ -17,6 +17,10 @@ git clone --no-checkout https://github.com/devgianlu/go-librespot.git "$source_d
 git -C "$source_dir" checkout --detach "$pin"
 git -C "$source_dir" apply --check "$here/framed.patch"
 git -C "$source_dir" apply "$here/framed.patch"
+git -C "$source_dir" apply --check "$here/native-decoder.patch"
+git -C "$source_dir" apply "$here/native-decoder.patch"
+mkdir -p "$source_dir/vorbis/testdata"
+cp "$here/native-decoder-tone.ogg" "$source_dir/vorbis/testdata/close-tone.ogg"
 cd "$source_dir"
 "$go_binary" version
 "$go_binary" test -race -tags test_unit -count=1 ./...
