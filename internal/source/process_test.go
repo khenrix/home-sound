@@ -252,3 +252,22 @@ func TestStderrSummaryMatchesAcrossWritesWithoutInspectingPayloadFields(t *testi
 	// Header-like text in an error field is escaped by the actual TextFormatter;
 	// neither embedded panic text nor its field values are emitted or retained.
 }
+
+func TestStderrSummaryIgnoresQuotedHeaderLookalikesAcrossChunks(t *testing.T) {
+	text := "time=\"fixture\" level=info msg=ordinary error=\"remote text level=error more\"\n" +
+		"time=\"fixture\" level=info msg=\"quoted \\\"escape\\\" level=error more\"\n" +
+		"time=\"fixture\" level=error msg=\"output device failed\" error=\"remote level=error value\"\n" +
+		"level=error msg=\"failed restoring session after logout\" error=\"remote level=error value\"\n"
+	for _, width := range []int{1, 7, len(text)} {
+		scan := &diagnosticScan{}
+		w := &discardLimit{remaining: 4096, scan: scan, cancel: func() { t.Fatal("short fixture hit byte limit") }}
+		for pos := 0; pos < len(text); pos += width {
+			if _, e := w.Write([]byte(text[pos:min(pos+width, len(text))])); e != nil {
+				t.Fatal(e)
+			}
+		}
+		if scan.count != [5]uint16{0, 0, 2, 1, 1} {
+			t.Errorf("chunk width %d counted value text or missed real header: %v", width, scan.count)
+		}
+	}
+}

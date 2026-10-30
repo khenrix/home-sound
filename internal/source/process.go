@@ -196,9 +196,10 @@ func (p *Process) StderrSummary() StderrSummary {
 // Only match fixed diagnostic headers. Retain finite match positions/counts,
 // never bytes, lines, error fields or a hash of private diagnostic text.
 type diagnosticScan struct {
-	started bool
-	match   [5]int
-	count   [5]uint16
+	started         bool
+	quoted, escaped bool
+	match           [5]int
+	count           [5]uint16
 }
 
 var diagnosticPatterns = [5]string{"\npanic: ", "\nfatal error: ", " level=error ", " msg=\"output device failed\"", " msg=\"failed restoring session after logout\""}
@@ -214,9 +215,20 @@ func (s *diagnosticScan) feed(p []byte) {
 }
 func (s *diagnosticScan) byte(b byte) {
 	for i, pattern := range diagnosticPatterns {
-		if b == pattern[s.match[i]] {
+		c := b
+		if i >= 2 {
+			// A fixed msg value may finish a match begun outside quotes. New
+			// field matches cannot start inside a quoted value or escaped quote.
+			if s.match[i] == 0 && s.quoted {
+				continue
+			}
+			if b == '\n' {
+				c = ' '
+			}
+		}
+		if c == pattern[s.match[i]] {
 			s.match[i]++
-		} else if b == pattern[0] {
+		} else if c == pattern[0] && (i < 2 || !s.quoted) {
 			s.match[i] = 1
 		} else {
 			s.match[i] = 0
@@ -225,5 +237,21 @@ func (s *diagnosticScan) byte(b byte) {
 			s.count[i]++
 			s.match[i] = 0
 		}
+	}
+	if b == '\n' {
+		s.quoted = false
+		s.escaped = false
+		return
+	}
+	if s.escaped {
+		s.escaped = false
+		return
+	}
+	if s.quoted && b == '\\' {
+		s.escaped = true
+		return
+	}
+	if b == '"' {
+		s.quoted = !s.quoted
 	}
 }
