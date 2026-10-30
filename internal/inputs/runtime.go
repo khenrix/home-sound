@@ -139,7 +139,7 @@ func (r *Runtime) spotify(ctx context.Context, c Config, id Identity, n int, co 
 	if e = Save(filepath.Join(dir, "config.yml"), yaml); e != nil {
 		return e
 	}
-	process, e := source.StartDaemon(ctx, c.Spotify.Helper, []string{"-config_dir", dir})
+	process, e := source.StartDaemon(ctx, c.Spotify.Helper, spotifyArgs(dir))
 	if e != nil {
 		return e
 	}
@@ -340,3 +340,5 @@ func (r *Runtime) youtube(ctx context.Context, c Config, ids []Identity, co *sou
 }
 
 func deploymentDecoderVersion(v string) bool { return v == "9.0.2" || v == "n9.0.2" }
+
+func spotifyArgs(dir string) []string { return []string{"--config_dir", dir} }
