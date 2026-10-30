@@ -83,9 +83,29 @@ python3 helpers/airplay/build.py --owned-ptp /path/to/canonical/airplay-cli /new
 python3 helpers/airplay/build.py --owned-ptp --combined /path/to/canonical/airplay-cli /new/owned-combined-directory
 ```
 
+Both owned variants also apply `clock-watch.patch`: receiver readiness continues
+after the first READY, at the existing 250 ms sampling cadence. Only state or
+material projected-time changes produce status lines. The actual C tests execute
+the peer-expiry query, readiness calculation and CLI reporter with controlled
+time and exchange timestamps, without device traffic. A lost receiver can stop
+its Go output while another output and the owned daemon continue.
+
 The first leaves NTP behavior at the release baseline and is named
-`0.5.9-homesound-owned-ptp`; the second includes both experimental NTP patches.
+`0.5.9-homesound-owned-ptp-r2`; the second is
+`0.5.9-homesound-owned-combined-r2` and includes both experimental NTP patches.
 The original three Stage-A candidates remain separately recorded in
-`build-manifest.json`; the owned candidate is in `owned-build-manifest.json`.
+`build-manifest.json`; owned variants are in `owned-build-manifest.json` and
+`owned-combined-build-manifest.json`.
 Select every candidate explicitly by path and exact checksum. No privileged
 setup, live playback or acoustic validation is performed by this recipe.
+
+The Go integration test consumes the compiled C reporter's output. Build it from
+one of the retained patched source directories and run:
+
+```
+python3 helpers/airplay/tests/clock.py /path/to/owned-source --output /absolute/clock-report
+HOME_SOUND_C_CLOCK_FIXTURE=/absolute/clock-report go test -race -count=1 ./internal/airplay -run TestActualCReceiverLossStopsOnlyDependentOutput
+```
+
+Without this environment variable, that integration test explicitly skips; the
+ordinary Go fixtures remain available. The builder always runs the C regression.

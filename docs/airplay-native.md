@@ -133,6 +133,17 @@ A hard-killed daemon may leave its private shared-memory object; the next
 generation uses a different name, and unknown orphan objects are left intact.
 The Go manager currently rejects non-Linux hosts explicitly.
 
+Owned helpers also keep per-receiver readiness observation active after READY.
+The helper's existing 250 ms reporting cadence and shared peer-query poller
+continue; unchanged readiness does not generate repeated status lines. The
+daemon expires a receiver's exchange snapshot after a three-second gap. Once
+the stream observes a non-ready PTP state, Go cancels that stream and rejects
+further PCM/START. Other receivers can retain the shared daemon. Prepare rechecks
+effective clock readiness under its lock after native checks and before
+publishing Ready. This is receiver exchange evidence, separate from daemon
+publication health; actual detection and audible stop latency remain hardware
+observations, including existing polling, I/O and process teardown delays.
+
 `Status.Transport`, `RouteVerified`, `CapabilitiesVerified`, `SharedPTP` and
 `PTPDaemonHealthy` describe transport evidence. They do not certify audibility
 or acoustic synchronization. The shared daemon and 44.1 kHz route still need

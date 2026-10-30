@@ -397,9 +397,9 @@ func (a *Adapter) Prepare(ctx context.Context, epoch, first uint64) (resultErr e
 		}()
 	}
 	a.mu.Lock()
-	if !a.status.Healthy {
+	if !a.status.Healthy || !clockAllowsStart(a.status) {
 		a.mu.Unlock()
-		return errors.New("AirPlay helper ended")
+		return errors.New("AirPlay helper lost transport readiness")
 	}
 	a.status.Ready = true
 	a.signalLocked()

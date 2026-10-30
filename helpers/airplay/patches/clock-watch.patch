@@ -1,0 +1,84 @@
+--- a/src/cliairplay.c
++++ b/src/cliairplay.c
+@@ -239,12 +239,12 @@
+  * instant the caller would plan against moving further than
+  * CLOCK_READY_JITTER_MS from the one last reported; the exchange count rides
+  * along as telemetry but never triggers a line on its own — rate-limited to one
+- * sample per AP2_CLOCK_VERIFY_POLL_MS, ending at the first state=ready. FLUSH
+- * and START re-arm it for the next cycle, comparison baseline included.
++ * sample per AP2_CLOCK_VERIFY_POLL_MS. Home Sound keeps observation active
++ * after ready so a lost receiver is reported even while the daemon is alive.
++ * FLUSH and START reset the comparison baseline for the next cycle.
+  * state=stalled does NOT end it: a receiver that begins probing late still
+  * reports probing and then ready. */
+ static bool g_clock_ready_reported = false;   /* emitted at least once this cycle */
+-static bool g_clock_ready_done = false;       /* terminal state=ready reported */
+ static uint64_t g_clock_ready_next_ntp = 0;
+ static ap2_clock_state_t g_clock_ready_state = AP2_CLOCK_COLD;
+ static uint64_t g_clock_ready_at_ms = 0;
+@@ -252,7 +252,6 @@
+ static void clock_ready_rearm(void)
+ {
+     g_clock_ready_reported = false;
+-    g_clock_ready_done = false;
+     g_clock_ready_next_ntp = 0;
+     /* The comparison baseline goes with them. A cycle judged against the
+      * previous one's reading gets its own first transition wrong: a session
+@@ -260,11 +259,7 @@
+      * the state without the diagnosis that explains what a stall means. */
+     g_clock_ready_state = AP2_CLOCK_COLD;
+     g_clock_ready_at_ms = 0;
+-    /* Reporting went terminal at the last ready and stopped asking, so under
+-     * the in-process engine — which has no poller to follow the receiver
+-     * meanwhile — the stall mark is as old as that quiet stretch. Restart the
+-     * window here so the first reading after the re-arm measures the receiver,
+-     * not the silence of nobody having looked. */
++    /* Start a new stall observation window for this playback cycle. */
+     ap2cl_clock_watch_restart(g_ap2cl);
+ }
+ 
+@@ -280,7 +275,6 @@
+ 
+ static void clock_ready_tick(void)
+ {
+-    if (g_clock_ready_done) return;
+     uint64_t now = raopcl_get_ntp(NULL);
+     if (g_clock_ready_reported && now < g_clock_ready_next_ntp) return;
+     g_clock_ready_next_ntp = now + MS2NTP(AP2_CLOCK_VERIFY_POLL_MS);
+@@ -290,10 +284,9 @@
+     /* Material change only: the state, or a projected instant that moved
+      * further than the reading's own jitter. Measured against what was last
+      * reported rather than against the last sample, so a slow drift still
+-     * surfaces once it has grown past the tolerance. The terminal state=ready
+-     * is out of the tolerance's reach either way — it is a state change, and
+-     * once reported the latch below ends the reporting above — and the line is
+-     * always formatted from this reading, never from the latched values. */
++     * surfaces once it has grown past the tolerance. State changes bypass the
++     * time tolerance, including ready -> cold/stalled; unchanged readings do
++     * not add log traffic. Format the current reading, never cached values. */
+     uint64_t moved = r.ready_at_unix_ms > g_clock_ready_at_ms
+         ? r.ready_at_unix_ms - g_clock_ready_at_ms
+         : g_clock_ready_at_ms - r.ready_at_unix_ms;
+@@ -307,7 +300,6 @@
+     g_clock_ready_reported = true;
+     g_clock_ready_state = r.state;
+     g_clock_ready_at_ms = r.ready_at_unix_ms;
+-    g_clock_ready_done = r.state == AP2_CLOCK_READY;
+     status_print("[STATUS] clock_ready mode=%s state=%s streak_ms=%" PRIu64
+                  " exchanges=%u ready_in_ms=%" PRIu64
+                  " ready_at_unix_ms=%" PRIu64,
+--- a/src/ap2_client.c
++++ b/src/ap2_client.c
+@@ -3629,10 +3629,8 @@
+         p->clock_verify_have_exchange = have;
+         if (have) {
+             p->clock_verify_exchange = ex;
+-            /* The stall window is measured from here because this loop is the
+-             * only thing that follows the receiver for a whole session:
+-             * readiness reporting goes terminal at the first ready and stops
+-             * asking until a flush or start re-arms it. */
++            /* Home Sound keeps readiness reporting active; this poller owns
++             * the last-exchange mark and refreshes it only from live queries. */
+             p->clock_last_streak_unix_ms = now_ms;
+         }
+         pthread_mutex_unlock(&p->clock_verify_lock);
