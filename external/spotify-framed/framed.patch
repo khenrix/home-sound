@@ -1,0 +1,924 @@
+diff --git a/daemon/controls.go b/daemon/controls.go
+index cfe8540..5fc42fc 100644
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -127,6 +127,9 @@ func closeSource(source librespot.AudioSource) {
+ }
+ 
+ func (p *AppPlayer) commitPrefetch(stream *player.Stream, source librespot.AudioSource) {
++	if p.app.cfg != nil && p.app.cfg.AudioBackend == "framed" {
++		source = stream.FramedSource(source)
++	}
+ 	p.secondaryStream = stream
+ 	p.secondarySource = source
+ 	p.player.SetSecondaryStream(source)
+@@ -941,6 +944,9 @@ type fetchTrackOpts struct {
+ // for what it handed over, so that the ones held for the outgoing stream can be
+ // told apart from them.
+ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId, opts fetchTrackOpts) (*player.Stream, uint64, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, 0, err
++	}
+ 	log := p.app.log.WithField("uri", spotId.Uri())
+ 
+ 	stream := opts.prefetchedStream
+@@ -987,6 +993,15 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
+ 		source = p.narrate(ctx, opts.metadata, spotId.Uri(), source, opts.introPrefix)
+ 	}
+ 
++	if err := ctx.Err(); err != nil {
++		if opts.prefetchedStream == nil {
++			closeSource(source)
++		}
++		return nil, 0, err
++	}
++	if p.app.cfg != nil && p.app.cfg.AudioBackend == "framed" {
++		source = stream.FramedSource(source)
++	}
+ 	if err := p.player.SetPrimaryStream(source, opts.paused, opts.drop); err != nil {
+ 		return nil, 0, fmt.Errorf("failed setting stream for %s: %w", spotId, err)
+ 	}
+diff --git a/daemon/framed_test.go b/daemon/framed_test.go
+new file mode 100644
+index 0000000..cbf9566
+--- /dev/null
++++ b/daemon/framed_test.go
+@@ -0,0 +1,69 @@
++//go:build test_unit
++
++package daemon
++
++import (
++	"context"
++	"errors"
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/player"
++	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
++	"testing"
++)
++
++type frameTestSource struct {
++	cancel context.CancelFunc
++	closed int
++}
++
++func (*frameTestSource) Read(p []float32) (int, error) { return 0, nil }
++func (s *frameTestSource) SetPositionMs(int64) error {
++	if s.cancel != nil {
++		s.cancel()
++	}
++	return nil
++}
++func (s *frameTestSource) Close() error    { s.closed++; return nil }
++func (*frameTestSource) PositionMs() int64 { return 0 }
++func frameTestStream() *player.Stream {
++	name := "Title"
++	duration := int32(1000)
++	return &player.Stream{RequestedId: librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeTrack, make([]byte, 16)), Source: &frameTestSource{}, Media: librespot.NewMediaFromTrack(&metadatapb.Track{Name: &name, Duration: &duration})}
++}
++func TestFramedPrefetchIdentityBeforeInstallation(t *testing.T) {
++	p := newTestAppPlayer(t)
++	p.app.cfg = &Config{AudioBackend: "framed"}
++	s := frameTestStream()
++	p.commitPrefetch(s, s.Source)
++	if _, ok := p.secondarySource.(interface{ FramedIdentity() string }); !ok {
++		t.Fatal("prefetch installed source without immutable framed identity")
++	}
++}
++func TestFramedCanceledFetchCannotInstall(t *testing.T) {
++	p := newTestAppPlayer(t)
++	p.app.cfg = &Config{AudioBackend: "framed"}
++	s := frameTestStream()
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	_, _, e := p.fetchTrack(ctx, s.RequestedId, fetchTrackOpts{prefetchedStream: s, fromStart: true})
++	if !errors.Is(e, context.Canceled) {
++		t.Fatalf("canceled loader reached player: %v", e)
++	}
++}
++
++func TestFramedCanceledBorrowedPrefetchIsNotClosed(t *testing.T) {
++	p := newTestAppPlayer(t)
++	p.app.cfg = &Config{AudioBackend: "framed"}
++	s := frameTestStream()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	src := s.Source.(*frameTestSource)
++	src.cancel = cancel
++	_, _, e := p.fetchTrack(ctx, s.RequestedId, fetchTrackOpts{prefetchedStream: s, fromStart: false})
++	if !errors.Is(e, context.Canceled) {
++		t.Fatal(e)
++	}
++	if src.closed != 0 {
++		t.Fatal("canceled loader closed player-owned prefetched source")
++	}
++}
+diff --git a/output/driver-framed.go b/output/driver-framed.go
+new file mode 100644
+index 0000000..6a97ab1
+--- /dev/null
++++ b/output/driver-framed.go
+@@ -0,0 +1,207 @@
++package output
++
++import (
++	"crypto/rand"
++	"encoding/binary"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"io"
++	"math"
++	"net"
++	"sync"
++	"time"
++)
++
++type framedReader interface {
++	ReadTagged([]float32) (int, uint64, uint64, string, string, error)
++	FramedState() (uint64, uint64, string, string)
++}
++type framedCommand struct {
++	kind string
++	ack  chan error
++}
++type framedOutput struct {
++	conn         net.Conn
++	reader       framedReader
++	nonce        string
++	commands     chan framedCommand
++	done         chan struct{}
++	closed       chan struct{}
++	err          chan error
++	volumeUpdate chan float32
++	volumeMu     sync.Mutex
++	closeOnce    sync.Once
++}
++
++// The peer grants exactly one 20ms read with byte 1. No speculative decoder
++// reads or application queue are kept. Kernel buffering can contain only that
++// one response when a conforming peer allows only one outstanding request.
++func newFramedOutput(o *NewOutputOptions) (Output, error) {
++	r, ok := o.Reader.(framedReader)
++	if !ok || o.SampleRate != 44100 || o.ChannelCount != 2 || !o.ExternalVolume {
++		return nil, errors.New("framed output requires tagged stereo 44100 and external volume")
++	}
++	c, e := net.DialTimeout("unix", o.OutputPipe, time.Second)
++	if e != nil {
++		return nil, errors.New("framed endpoint unavailable")
++	}
++	var nonce [16]byte
++	if _, e = rand.Read(nonce[:]); e != nil {
++		c.Close()
++		return nil, e
++	}
++	f := &framedOutput{conn: c, reader: r, nonce: hex.EncodeToString(nonce[:]), commands: make(chan framedCommand), done: make(chan struct{}), closed: make(chan struct{}), err: make(chan error, 1), volumeUpdate: o.VolumeUpdate}
++	go f.run()
++	return f, nil
++}
++func (f *framedOutput) run() {
++	defer close(f.done)
++	defer f.conn.Close()
++	paused := true
++	credit := false
++	statusOnly := false
++	for {
++		select {
++		case <-f.closed:
++			return
++		default:
++		}
++		select {
++		case cmd := <-f.commands:
++			switch cmd.kind {
++			case "pause":
++				paused = true
++			case "resume":
++				paused = false
++			case "drop":
++				paused = true
++			}
++			cmd.ack <- nil
++		default:
++		}
++		if !credit {
++			f.conn.SetReadDeadline(time.Now().Add(25 * time.Millisecond))
++			var request [1]byte
++			_, e := io.ReadFull(f.conn, request[:])
++			if e != nil {
++				if n, ok := e.(net.Error); ok && n.Timeout() {
++					continue
++				}
++				return
++			}
++			if request[0] != 1 && request[0] != 2 {
++				f.err <- errors.New("invalid framed credit")
++				return
++			}
++			credit = true
++			statusOnly = request[0] == 2
++		}
++		samples := make([]float32, 1764)
++		var n int
++		var g, offset uint64
++		var identity, reason string
++		var readErr error
++		transport := "playing"
++		if paused {
++			transport = "paused"
++		}
++		if paused || statusOnly {
++			g, offset, identity, reason = f.reader.FramedState()
++		} else {
++			n, g, offset, identity, reason, readErr = f.reader.ReadTagged(samples)
++		}
++
++		if n < 0 || n > len(samples) || n%2 != 0 || len(identity) > 8192 || !json.Valid([]byte(identity)) {
++			f.err <- errors.New("invalid framed source record")
++			return
++		}
++		pcm := make([]byte, 4*n)
++		for i, v := range samples[:n] {
++			if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
++				f.err <- errors.New("nonfinite framed PCM")
++				return
++			}
++			binary.LittleEndian.PutUint32(pcm[i*4:], math.Float32bits(v))
++		}
++		terminal := ""
++		if errors.Is(readErr, io.EOF) {
++			terminal = "track_end"
++			paused = true
++		} else if readErr != nil {
++			terminal = "error"
++		}
++		record := struct {
++			Version            int
++			Nonce              string
++			Generation, Offset uint64
++			Identity           json.RawMessage
++			Reason             string
++			Rate, Channels     int
++			PCM                []byte
++			Terminal           string
++			Transport          string
++		}{1, f.nonce, g, offset, json.RawMessage(identity), reason, 44100, 2, pcm, terminal, transport}
++		body, e := json.Marshal(record)
++		if e != nil || len(body) > 32768 {
++			f.err <- errors.New("framed record too large")
++			return
++		}
++		packet := make([]byte, 4+len(body))
++		binary.BigEndian.PutUint32(packet, uint32(len(body)))
++		copy(packet[4:], body)
++		// No source/state mutex is held during transport writes. A control barrier
++		// waits for this one ordered record or observes the failed/closed channel.
++		f.conn.SetWriteDeadline(time.Now().Add(250 * time.Millisecond))
++		for len(packet) > 0 {
++			n, e := f.conn.Write(packet)
++			if e != nil {
++				f.err <- errors.New("framed consumer stalled or disconnected")
++				return
++			}
++			packet = packet[n:]
++		}
++		credit = false
++		if terminal == "error" {
++			f.err <- errors.New("framed decoder failed")
++			return
++		}
++	}
++}
++func (f *framedOutput) command(kind string) error {
++	cmd := framedCommand{kind, make(chan error, 1)}
++	timer := time.NewTimer(500 * time.Millisecond)
++	defer timer.Stop()
++	select {
++	case f.commands <- cmd:
++	case <-f.done:
++		return errors.New("framed output closed")
++	case <-timer.C:
++		f.Close()
++		return errors.New("framed control timed out")
++	}
++	select {
++	case e := <-cmd.ack:
++		return e
++	case <-f.done:
++		return errors.New("framed output closed")
++	case <-timer.C:
++		f.Close()
++		return errors.New("framed control timed out")
++	}
++}
++func (f *framedOutput) Pause() error            { return f.command("pause") }
++func (f *framedOutput) Resume() error           { return f.command("resume") }
++func (f *framedOutput) Drop() error             { return f.command("drop") }
++func (f *framedOutput) DelayMs() (int64, error) { return 0, nil }
++func (f *framedOutput) SetVolume(v float32) {
++	f.volumeMu.Lock()
++	defer f.volumeMu.Unlock()
++	sendVolumeUpdate(f.volumeUpdate, v)
++}
++func (f *framedOutput) Error() <-chan error { return f.err }
++func (f *framedOutput) Close() error {
++	var e error
++	f.closeOnce.Do(func() { close(f.closed); e = f.conn.Close() })
++	return e
++}
+diff --git a/output/framed_test.go b/output/framed_test.go
+new file mode 100644
+index 0000000..538ab97
+--- /dev/null
++++ b/output/framed_test.go
+@@ -0,0 +1,256 @@
++package output
++
++import (
++	"bytes"
++	"context"
++	"encoding/binary"
++	"encoding/json"
++	"io"
++	"net"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++type framedFixture struct{}
++
++func (*framedFixture) Read(p []float32) (int, error) { p[0], p[1] = .25, -.25; return 2, nil }
++func (s *framedFixture) ReadTagged(p []float32) (int, uint64, uint64, string, string, error) {
++	n, e := s.Read(p)
++	return n, 1, 0, `{"uri":"spotify:track:test","title":"Test"}`, "source", e
++}
++func TestFramedBackendPullAndBlockedClose(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "pcm.sock")
++	l, e := net.Listen("unix", path)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer l.Close()
++	accept := make(chan net.Conn, 1)
++	go func() { c, _ := l.Accept(); accept <- c }()
++	out, e := NewOutput(&NewOutputOptions{Backend: "framed", Reader: &framedFixture{}, OutputPipe: path, SampleRate: 44100, ChannelCount: 2, ExternalVolume: true, VolumeUpdate: make(chan float32, 1)})
++	if e != nil {
++		t.Fatalf("framed output unavailable: %v", e)
++	}
++	defer out.Close()
++	c := <-accept
++	defer c.Close()
++	out.Resume()
++	c.SetReadDeadline(time.Now().Add(40 * time.Millisecond))
++	var one [1]byte
++	if _, e := c.Read(one[:]); e == nil {
++		t.Fatal("helper produced PCM without demand")
++	}
++	c.SetReadDeadline(time.Now().Add(time.Second))
++	c.Write([]byte{1})
++	var size uint32
++	if e = binary.Read(c, binary.BigEndian, &size); e != nil {
++		t.Fatal(e)
++	}
++	if size > 32768 {
++		t.Fatalf("unbounded record %d", size)
++	}
++	b := make([]byte, size)
++	if _, e = io.ReadFull(c, b); e != nil {
++		t.Fatal(e)
++	}
++	var r struct {
++		Version            int
++		Nonce              string
++		Generation, Offset uint64
++		PCM                []byte
++		Identity           json.RawMessage
++	}
++	if e = json.Unmarshal(b, &r); e != nil {
++		t.Fatal(e)
++	}
++	if r.Version != 1 || len(r.Nonce) != 32 || r.Generation != 1 || r.Offset != 0 || len(r.PCM) != 8 || binary.LittleEndian.Uint32(r.PCM) != 0x3e800000 {
++		t.Fatalf("wrong record: %+v", r)
++	}
++	// A consumer withholding reads must not hold Pause/Drop/Close forever.
++	c.Write([]byte{1})
++	done := make(chan struct{})
++	go func() { out.Pause(); out.Drop(); out.Close(); close(done) }()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("blocked sink deadlocked controls")
++	}
++}
++func TestFramedCloseAfterPausedCreditReapsWriter(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "pcm.sock")
++	l, e := net.Listen("unix", path)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer l.Close()
++	accept := make(chan net.Conn, 1)
++	go func() { c, _ := l.Accept(); accept <- c }()
++	out, e := newFramedOutput(&NewOutputOptions{Reader: &framedFixture{}, OutputPipe: path, SampleRate: 44100, ChannelCount: 2, ExternalVolume: true})
++	if e != nil {
++		t.Fatal(e)
++	}
++	c := <-accept
++	defer c.Close()
++	c.Write([]byte{1})
++	time.Sleep(30 * time.Millisecond)
++	out.Close()
++	select {
++	case <-out.(*framedOutput).done:
++	case <-time.After(100 * time.Millisecond):
++		t.Fatal("paused credited writer leaked after Close")
++	}
++}
++func TestFramedSubprocessBlockedSink(t *testing.T) {
++	if path := os.Getenv("FRAMED_TEST_SOCKET"); path != "" {
++		out, e := newFramedOutput(&NewOutputOptions{Reader: &largeFramedFixture{}, OutputPipe: path, SampleRate: 44100, ChannelCount: 2, ExternalVolume: true})
++		if e != nil {
++			t.Fatal(e)
++		}
++		if e = out.Resume(); e != nil {
++			t.Fatal(e)
++		}
++		time.Sleep(100 * time.Millisecond)
++		start := time.Now()
++		if out.Pause() == nil {
++			t.Fatal("expected stalled transport to fail barrier")
++		}
++		_ = out.Drop()
++		out.Close()
++		if time.Since(start) > time.Second {
++			t.Fatal("controls exceeded bound")
++		}
++		select {
++		case <-out.(*framedOutput).done:
++		case <-time.After(time.Second):
++			t.Fatal("writer not reaped")
++		}
++		return
++	}
++	path := filepath.Join(t.TempDir(), "pcm.sock")
++	l, e := net.Listen("unix", path)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer l.Close()
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestFramedSubprocessBlockedSink$")
++	cmd.Env = append(os.Environ(), "FRAMED_TEST_SOCKET="+path)
++	var diagnostic bytes.Buffer
++	cmd.Stderr = &diagnostic
++	cmd.Stdout = &diagnostic
++	if e = cmd.Start(); e != nil {
++		t.Fatal(e)
++	}
++	c, e := l.Accept()
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer c.Close()
++	credits := bytes.Repeat([]byte{1}, 65536)
++	c.SetWriteDeadline(time.Now().Add(time.Second))
++	_, _ = c.Write(credits)
++	if e = cmd.Wait(); e != nil {
++		t.Fatalf("subprocess %v: %s", e, &diagnostic)
++	}
++}
++func TestFramedBlockedStartupBound(t *testing.T) {
++	start := time.Now()
++	_, e := newFramedOutput(&NewOutputOptions{Reader: &framedFixture{}, OutputPipe: filepath.Join(t.TempDir(), "absent.sock"), SampleRate: 44100, ChannelCount: 2, ExternalVolume: true})
++	if e == nil || time.Since(start) > 1500*time.Millisecond {
++		t.Fatalf("startup not bounded: %v", e)
++	}
++}
++
++type largeFramedFixture struct{ framedFixture }
++
++func (s *largeFramedFixture) ReadTagged(p []float32) (int, uint64, uint64, string, string, error) {
++	return len(p), 1, 0, `{"uri":"test"}`, "source", nil
++}
++func TestFramedDropBarrierStaysPaused(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "pcm.sock")
++	l, e := net.Listen("unix", path)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer l.Close()
++	accept := make(chan net.Conn, 1)
++	go func() { c, _ := l.Accept(); accept <- c }()
++	out, e := newFramedOutput(&NewOutputOptions{Reader: &framedFixture{}, OutputPipe: path, SampleRate: 44100, ChannelCount: 2, ExternalVolume: true})
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer out.Close()
++	c := <-accept
++	defer c.Close()
++	out.Resume()
++	if e = out.Drop(); e != nil {
++		t.Fatal(e)
++	}
++	c.Write([]byte{1})
++	c.SetReadDeadline(time.Now().Add(time.Second))
++	var size uint32
++	if e = binary.Read(c, binary.BigEndian, &size); e != nil {
++		t.Fatal(e)
++	}
++	body := make([]byte, size)
++	io.ReadFull(c, body)
++	var record struct {
++		PCM       []byte
++		Transport string
++	}
++	json.Unmarshal(body, &record)
++	if len(record.PCM) != 0 || record.Transport != "paused" {
++		t.Fatal("Drop acknowledged but old source continued producing")
++	}
++	if e = out.Resume(); e != nil {
++		t.Fatal(e)
++	}
++	c.Write([]byte{1})
++	var b [1]byte
++	if _, e = c.Read(b[:]); e != nil {
++		t.Fatalf("resume failed: %v", e)
++	}
++}
++func (*framedFixture) FramedState() (uint64, uint64, string, string) {
++	return 3, 0, `{"uri":"paused"}`, "seek"
++}
++func TestFramedStatusCreditObservesPausedSeekWithoutPCM(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "pcm.sock")
++	l, e := net.Listen("unix", path)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer l.Close()
++	accept := make(chan net.Conn, 1)
++	go func() { c, _ := l.Accept(); accept <- c }()
++	out, e := newFramedOutput(&NewOutputOptions{Reader: &framedFixture{}, OutputPipe: path, SampleRate: 44100, ChannelCount: 2, ExternalVolume: true})
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer out.Close()
++	c := <-accept
++	defer c.Close()
++	c.SetDeadline(time.Now().Add(time.Second))
++	c.Write([]byte{2})
++	var n uint32
++	if e = binary.Read(c, binary.BigEndian, &n); e != nil {
++		t.Fatalf("no framed paused seek state: %v", e)
++	}
++	b := make([]byte, n)
++	io.ReadFull(c, b)
++	var r struct {
++		Generation        uint64
++		Transport, Reason string
++		PCM               []byte
++	}
++	if e = json.Unmarshal(b, &r); e != nil {
++		t.Fatal(e)
++	}
++	if r.Generation != 3 || r.Transport != "paused" || r.Reason != "seek" || len(r.PCM) != 0 {
++		t.Fatalf("state read consumed PCM or lost generation: %+v", r)
++	}
++}
+diff --git a/output/output.go b/output/output.go
+index 4470f02..d9a1927 100644
+--- a/output/output.go
++++ b/output/output.go
+@@ -126,6 +126,8 @@ type NewOutputOptions struct {
+ 
+ func NewOutput(options *NewOutputOptions) (Output, error) {
+ 	switch options.Backend {
++	case "framed":
++		return newFramedOutput(options)
+ 	case "alsa":
+ 		out, err := newAlsaOutput(options)
+ 		if err != nil {
+diff --git a/player/framed_source_test.go b/player/framed_source_test.go
+new file mode 100644
+index 0000000..23a5df6
+--- /dev/null
++++ b/player/framed_source_test.go
+@@ -0,0 +1,112 @@
++package player
++
++import (
++	"errors"
++	"io"
++	"testing"
++)
++
++// These fixtures exercise SwitchingAudioSource itself, including promotion in Read.
++type taggedReader interface {
++	ReadTagged([]float32) (int, uint64, uint64, string, string, error)
++}
++type sentinel struct {
++	value    float32
++	eof      bool
++	fail     bool
++	identity string
++}
++
++func (s *sentinel) Read(p []float32) (int, error) {
++	p[0], p[1] = s.value, s.value
++	if s.eof {
++		return 2, io.EOF
++	}
++	return 2, nil
++}
++func (s *sentinel) SetPositionMs(int64) error {
++	if s.fail {
++		return errors.New("seek failure")
++	}
++	s.value = 9
++	return nil
++}
++func (*sentinel) PositionMs() int64        { return 0 }
++func (s *sentinel) FramedIdentity() string { return s.identity }
++func tagged(t *testing.T, s *SwitchingAudioSource) taggedReader {
++	t.Helper()
++	r, ok := any(s).(taggedReader)
++	if !ok {
++		t.Fatal("source cannot return read-coupled generation; buffered old samples are unidentifiable")
++	}
++	return r
++}
++func TestFramedOldTailPromotionAndAcknowledgement(t *testing.T) {
++	s := NewSwitchingAudioSource(0)
++	a := &sentinel{value: 1, eof: true, identity: `{"uri":"a"}`}
++	b := &sentinel{value: 2, identity: `{"uri":"b"}`}
++	s.SetPrimary(a)
++	s.SetSecondary(b)
++	r := tagged(t, s)
++	p := make([]float32, 2)
++	n, g, o, id, reason, e := r.ReadTagged(p)
++	if n != 2 || g != 1 || o != 0 || id != a.identity || reason != "source" || e != nil || p[0] != 1 {
++		t.Fatalf("old tail mislabeled: %d %d %d %s %s %v %v", n, g, o, id, reason, e, p)
++	}
++	n, g, o, id, reason, e = r.ReadTagged(p)
++	if n != 2 || g != 2 || o != 0 || id != b.identity || reason != "prefetch" || e != nil || p[0] != 2 {
++		t.Fatalf("promotion: %d %d %d %s %s %v %v", n, g, o, id, reason, e, p)
++	}
++	s.SetPrimary(b)
++	_, g, o, _, _, _ = r.ReadTagged(p)
++	if g != 2 || o != 1 {
++		t.Fatalf("duplicate acknowledgement reset timeline: gen=%d offset=%d", g, o)
++	}
++}
++func TestFramedSeekAndFailure(t *testing.T) {
++	s := NewSwitchingAudioSource(0)
++	a := &sentinel{value: 1, identity: `{"uri":"a"}`}
++	s.SetPrimary(a)
++	r := tagged(t, s)
++	p := make([]float32, 2)
++	r.ReadTagged(p)
++	if e := s.SetPositionMs(123); e != nil {
++		t.Fatal(e)
++	}
++	_, g, o, _, reason, _ := r.ReadTagged(p)
++	if g != 2 || o != 0 || reason != "seek" || p[0] != 9 {
++		t.Fatalf("seek mislabeled: %d %d %s %v", g, o, reason, p)
++	}
++	a.fail = true
++	if s.SetPositionMs(456) == nil {
++		t.Fatal("expected failed seek")
++	}
++	_, g, o, _, _, _ = r.ReadTagged(p)
++	if g != 2 || o != 1 {
++		t.Fatalf("failed seek changed generation: %d %d", g, o)
++	}
++}
++func TestFramedRejectsCrossfade(t *testing.T) {
++	s := NewSwitchingAudioSource(100)
++	s.SetPrimary(&sentinel{})
++	_, _, _, _, _, e := tagged(t, s).ReadTagged(make([]float32, 2))
++	if e == nil {
++		t.Fatal("crossfade must not carry a single-track tag")
++	}
++}
++func TestFramedStateDoesNotAdvancePausedSeek(t *testing.T) {
++	s := NewSwitchingAudioSource(0)
++	a := &sentinel{value: 1, identity: `{"uri":"a"}`}
++	s.SetPrimary(a)
++	s.SetPositionMs(123)
++	r, ok := any(s).(interface {
++		FramedState() (uint64, uint64, string, string)
++	})
++	if !ok {
++		t.Fatal("paused seek generation unavailable without consuming PCM")
++	}
++	g, o, id, reason := r.FramedState()
++	if g != 2 || o != 0 || id != a.identity || reason != "seek" {
++		t.Fatalf("state %d %d %s %s", g, o, id, reason)
++	}
++}
+diff --git a/player/framed_stream_test.go b/player/framed_stream_test.go
+new file mode 100644
+index 0000000..ee7dffb
+--- /dev/null
++++ b/player/framed_stream_test.go
+@@ -0,0 +1,40 @@
++package player
++
++import (
++	"encoding/json"
++	librespot "github.com/devgianlu/go-librespot"
++	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
++	"testing"
++)
++
++func TestStreamIdentityAttachedBeforePrefetch(t *testing.T) {
++	name := "Track"
++	s := &Stream{RequestedId: librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeTrack, make([]byte, 16)), Media: librespot.NewMediaFromTrack(&metadatapb.Track{Name: &name})}
++	adapter, ok := any(s).(interface {
++		FramedSource(librespot.AudioSource) librespot.AudioSource
++	})
++	if !ok {
++		t.Fatal("stream cannot attach immutable metadata before source installation")
++	}
++	original := &sentinel{value: 2}
++	wrapped := adapter.FramedSource(original)
++	id, ok := wrapped.(interface{ FramedIdentity() string })
++	if !ok {
++		t.Fatal("missing identity")
++	}
++	var m struct{ URI, Title string }
++	if json.Unmarshal([]byte(id.FramedIdentity()), &m) != nil || m.Title != "Track" || m.URI != "spotify:track:0000000000000000000000" {
++		t.Fatalf("identity %s", id.FramedIdentity())
++	}
++	if adapter.FramedSource(wrapped) != wrapped {
++		t.Fatal("prefetch acknowledgement got different source identity")
++	}
++	name = "mutated"
++	if id.FramedIdentity() == "" {
++		t.Fatal("empty metadata")
++	}
++	json.Unmarshal([]byte(id.FramedIdentity()), &m)
++	if m.Title != "Track" {
++		t.Fatal("metadata not immutable")
++	}
++}
+diff --git a/player/source.go b/player/source.go
+index 5611067..70c7f42 100644
+--- a/player/source.go
++++ b/player/source.go
+@@ -27,7 +27,9 @@ type SwitchingAudioSource struct {
+ 
+ 	done chan struct{}
+ 
+-	eofReported bool
++	eofReported              bool
++	pcmGeneration, pcmOffset uint64
++	pcmReason                string
+ 
+ 	// Crossfade state. When crossfadeSamples is zero the source behaves
+ 	// exactly as it did before crossfade support was introduced.
+@@ -93,6 +95,9 @@ func (s *SwitchingAudioSource) SetPrimary(source librespot.AudioSource) {
+ 		// in-flight crossfade tail.
+ 		s.resetCrossfade()
+ 		s.source[s.which] = source
++		s.pcmGeneration++
++		s.pcmOffset = 0
++		s.pcmReason = "source"
+ 	}
+ 
+ 	// If the same source was also prefetched into the secondary slot (e.g. a
+@@ -169,6 +174,9 @@ func (s *SwitchingAudioSource) readDirect(p []float32) (n int, err error) {
+ 		// delete current source and switch to the other one
+ 		delete(s.source, s.which)
+ 		s.which = !s.which
++		s.pcmGeneration++
++		s.pcmOffset = 0
++		s.pcmReason = "prefetch"
+ 
+ 		// ignore the EOF, we have more data
+ 		return n, nil
+@@ -420,6 +428,9 @@ func (s *SwitchingAudioSource) SetPositionMs(pos int64) error {
+ 		return err
+ 	}
+ 
++	s.pcmGeneration++
++	s.pcmOffset = 0
++	s.pcmReason = "seek"
+ 	if s.crossfadeSamples > 0 {
+ 		// The crossfade path can discover EOF and report done well before the
+ 		// audio finishes; a seek revives the source, so re-arm the signal.
+@@ -461,3 +472,42 @@ func (s *SwitchingAudioSource) Close() error {
+ 	}
+ 	return err
+ }
++
++// ReadTagged captures identity and generation under the same lock as decoder
++// Read. A tail returned with EOF keeps its old tag even if readDirect promotes
++// the prefetched source before returning. Offsets count decoded stereo frames,
++// never a claimed original-track sample position after an approximate seek.
++func (s *SwitchingAudioSource) ReadTagged(p []float32) (n int, generation, offset uint64, identity, reason string, err error) {
++	s.cond.L.Lock()
++	defer s.cond.L.Unlock()
++	if s.crossfadeSamples != 0 {
++		return 0, 0, 0, "", "", errors.New("framed backend requires crossfade disabled")
++	}
++	for s.source[s.which] == nil {
++		s.cond.Wait()
++	}
++	tagged, ok := s.source[s.which].(interface{ FramedIdentity() string })
++	if !ok {
++		return 0, 0, 0, "", "", errors.New("framed source identity missing")
++	}
++	generation, offset, identity, reason = s.pcmGeneration, s.pcmOffset, tagged.FramedIdentity(), s.pcmReason
++	n, err = s.readDirect(p)
++	if n%Channels != 0 {
++		return 0, generation, offset, identity, reason, errors.New("partial stereo frame")
++	}
++	if generation == s.pcmGeneration {
++		s.pcmOffset += uint64(n / Channels)
++	}
++	return
++}
++
++// FramedState observes a paused/discontinuous source without decoding samples.
++func (s *SwitchingAudioSource) FramedState() (uint64, uint64, string, string) {
++	s.cond.L.Lock()
++	defer s.cond.L.Unlock()
++	identity := "{}"
++	if t, ok := s.source[s.which].(interface{ FramedIdentity() string }); ok {
++		identity = t.FramedIdentity()
++	}
++	return s.pcmGeneration, s.pcmOffset, identity, s.pcmReason
++}
+diff --git a/player/stream.go b/player/stream.go
+index 13df76b..b348575 100644
+--- a/player/stream.go
++++ b/player/stream.go
+@@ -2,6 +2,8 @@ package player
+ 
+ import (
+ 	"bytes"
++	"encoding/json"
++	"strings"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
+@@ -45,3 +47,55 @@ func (s *Stream) Is(id librespot.SpotifyId) bool {
+ 		return false
+ 	}
+ }
++
++// FramedSource binds display identity before installation. A previously tagged
++// prefetch wrapper is returned unchanged so acknowledgement cannot reset PCM.
++func (s *Stream) FramedSource(source librespot.AudioSource) librespot.AudioSource {
++	if _, ok := source.(*framedSource); ok {
++		return source
++	}
++	fields := map[string]string{"uri": s.RequestedId.Uri(), "title": s.Media.Name()}
++	if s.Media.IsTrack() {
++		t := s.Media.Track()
++		if t.Album != nil {
++			fields["album"] = t.Album.GetName()
++		}
++		if len(t.Artist) > 0 {
++			fields["artist"] = t.Artist[0].GetName()
++		}
++	}
++	for k, v := range fields {
++		v = strings.Map(func(r rune) rune {
++			if r < ' ' || r == 127 {
++				return -1
++			}
++			return r
++		}, v)
++		if len(v) > 1024 {
++			v = string([]rune(v)[:min(256, len([]rune(v)))])
++		}
++		fields[k] = v
++	}
++	identity, _ := json.Marshal(fields)
++	// Narrated/DJ source positions are not covered by the ordinary-track seam.
++	if _, ok := source.(interface{ NoCrossfade() bool }); ok {
++		identity = nil
++	}
++	return &framedSource{source, string(identity)}
++}
++
++type framedSource struct {
++	librespot.AudioSource
++	identity string
++}
++
++func (s *framedSource) FramedIdentity() string { return s.identity }
++func (s *framedSource) Close() error {
++	switch c := s.AudioSource.(type) {
++	case interface{ Close() error }:
++		return c.Close()
++	case interface{ Close() }:
++		c.Close()
++	}
++	return nil
++}

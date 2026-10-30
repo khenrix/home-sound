@@ -1,0 +1,74 @@
+{
+  "repository": "http://archive.ubuntu.com/ubuntu",
+  "suites": [
+    "resolute",
+    "resolute-updates"
+  ],
+  "purpose": "local extracted amd64 test sysroot; not bundled runtime",
+  "artifacts": [
+    {
+      "artifact": "libasound2-dev_1.2.15.3-1ubuntu1.1_amd64.deb",
+      "sha256": "8e4bca41a403957cece9c42c494d3e994fd6a4a72e7eb34481acd08e8eb95c02"
+    },
+    {
+      "artifact": "libasound2t64_1.2.15.3-1ubuntu1.1_amd64.deb",
+      "sha256": "96e20cf5c9095ef54ba46fccffea5c01cf2de17a1012c5683a67e43504a6d726"
+    },
+    {
+      "artifact": "libflac-dev_1.5.0+ds-5_amd64.deb",
+      "sha256": "69010cb6fe110ed9c8f93a3f89c5e9659d2deb4b68bd486b840b7af10a8735f3"
+    },
+    {
+      "artifact": "libflac14_1.5.0+ds-5_amd64.deb",
+      "sha256": "ea6cbd9399a646b073d36d8d33444f39f9f1dd63f5fa8cd18906573f51cc305b"
+    },
+    {
+      "artifact": "libmpg123-0t64_1.33.3-2_amd64.deb",
+      "sha256": "5bb06d8890eecd357da520a21e592a93267bb4b48a4f8946d6d67c366f511bbd"
+    },
+    {
+      "artifact": "libmpg123-dev_1.33.3-2_amd64.deb",
+      "sha256": "69e7dfd790c358fdd63a95f45517d2e0d78a0de7d2852b8d36a9d6207cea40a3"
+    },
+    {
+      "artifact": "libogg-dev_1.3.6-2_amd64.deb",
+      "sha256": "c718e5e8be18da55b2a42cec9acb49e60d1f12bc2d19a50aae52fa87a758a6d7"
+    },
+    {
+      "artifact": "libogg0_1.3.6-2_amd64.deb",
+      "sha256": "9d62d5e64a55ecfc17a7aeb00a5ca5fdf095bd68c1c397146c81867bec35c31f"
+    },
+    {
+      "artifact": "libout123-0t64_1.33.3-2_amd64.deb",
+      "sha256": "13f8106fc25c009f65dc7408364c99c5e3c670c46e86245043faecb00db71473"
+    },
+    {
+      "artifact": "libpkgconf7_2.5.1-4_amd64.deb",
+      "sha256": "353f622f6432a3d65bedd3c23e0af98c2c438650b497b355772a56a05ebf7dd0"
+    },
+    {
+      "artifact": "libsyn123-0t64_1.33.3-2_amd64.deb",
+      "sha256": "e802ad5df0847306770ee7a8e0f4e25d40e760a224b8b8e4938348006eea554c"
+    },
+    {
+      "artifact": "libvorbis-dev_1.3.7-3build2_amd64.deb",
+      "sha256": "833db19ffee7fa12c8f6456707930e58217635e48b9584588cf8ec56afd2f63e"
+    },
+    {
+      "artifact": "libvorbis0a_1.3.7-3build2_amd64.deb",
+      "sha256": "e8577fd985c3a2bc61212be338207cc2a95e7d6892acaeccb3d455da13e4a480"
+    },
+    {
+      "artifact": "libvorbisenc2_1.3.7-3build2_amd64.deb",
+      "sha256": "b4230d0064eee971727b204e3d0644a4deb4a3d882eaac2304d379e7a5439f2a"
+    },
+    {
+      "artifact": "libvorbisfile3_1.3.7-3build2_amd64.deb",
+      "sha256": "8cd42cc285e34f915e0e769bcffab29c4267fb6453295ed309d50f8f376eef37"
+    },
+    {
+      "artifact": "pkgconf-bin_2.5.1-4_amd64.deb",
+      "sha256": "9690471f395b6652f2cd8962334b9400e26a10daf4af7bf2f2c1a0325c193f0b"
+    }
+  ]
+}
