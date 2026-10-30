@@ -20,6 +20,9 @@ func TestInputDiagnosticFixture(t *testing.T) {
 	case "input-stdout-limit":
 		os.Stdout.WriteString(strings.Repeat("secret-not-for-errors", 500))
 		time.Sleep(time.Hour)
+	case "input-panic-limit":
+		os.Stderr.WriteString("panic: " + strings.Repeat("secret-not-for-errors", 500))
+		time.Sleep(time.Hour)
 	case "input-stderr-limit":
 		os.Stderr.WriteString(strings.Repeat("secret-not-for-errors", 500))
 		time.Sleep(time.Hour)
@@ -42,8 +45,9 @@ func TestNativeHelperFailureIdentifiesClassAndSlotWithoutPayload(t *testing.T) {
 	h := source.Helper{Path: path, SHA256: hex.EncodeToString(sum[:])}
 	for slot, tc := range []struct{ mode, want string }{
 		{"input-stdout-limit", "input runtime stopped: spotify_stdout_limit slot=0 exit=-1"},
-		{"input-stderr-limit", "input runtime stopped: spotify_stderr_limit slot=1 exit=-1"},
+		{"input-stderr-limit", "input runtime stopped: spotify_stderr_limit slot=1 exit=-1 stderr_panic=0 stderr_fatal=0 stderr_errors=0 stderr_output=0 stderr_restore=0"},
 		{"input-exit", "input runtime stopped: spotify_exit slot=2 exit=7"},
+		{"input-panic-limit", "input runtime stopped: spotify_stderr_limit slot=3 exit=-1 stderr_panic=1 stderr_fatal=0 stderr_errors=0 stderr_output=0 stderr_restore=0"},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)

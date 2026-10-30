@@ -38,6 +38,11 @@ func TestProcessFixture(t *testing.T) {
 	case "fixture-data":
 		os.Stdout.Write([]byte{1, 2, 3})
 		os.Exit(0)
+	case "fixture-panic-limit":
+		panic(strings.Repeat("synthetic-private-marker", 400))
+	case "fixture-output-log-limit":
+		os.Stderr.WriteString(strings.Repeat("time=\"fixture\" level=error msg=\"output device failed\" error=\"synthetic-private-marker\"\n", 100))
+		time.Sleep(time.Hour)
 	case "fixture-stderr-limit":
 		os.Stderr.WriteString(strings.Repeat("private-token-must-not-escape", 400))
 		time.Sleep(time.Hour)
@@ -197,4 +202,53 @@ func TestProcessExitDiagnosticClassifiesWithoutPayload(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestStderrBudgetDiagnosticDistinguishesPanicFromOutputErrorStorm(t *testing.T) {
+	for _, mode := range []string{"fixture-panic-limit", "fixture-output-log-limit"} {
+		t.Run(mode, func(t *testing.T) {
+			p, e := StartDaemon(context.Background(), testHelper(t), []string{"-test.run=^TestProcessFixture$", mode})
+			if e != nil {
+				t.Fatal(e)
+			}
+			defer p.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			for {
+				_, e = p.Read(ctx, make([]byte, 1024))
+				if e != nil {
+					break
+				}
+			}
+			summary := p.StderrSummary()
+			if mode == "fixture-panic-limit" {
+				if summary.Panic != 1 || summary.Errors != 0 {
+					t.Fatalf("Go panic was not safely classified: %+v", summary)
+				}
+			} else if summary.Panic != 0 || summary.OutputFailures < 2 || summary.Errors != summary.OutputFailures {
+				t.Fatalf("output-error burst was not safely classified: %+v", summary)
+			}
+			class, _ := p.ExitDiagnostic()
+			if class != "stderr_limit" {
+				t.Fatalf("diagnostic classification changed original limit: %q", class)
+			}
+		})
+	}
+}
+
+func TestStderrSummaryMatchesAcrossWritesWithoutInspectingPayloadFields(t *testing.T) {
+	scan := &diagnosticScan{}
+	stopped := false
+	w := &discardLimit{remaining: 4096, scan: scan, cancel: func() { stopped = true }}
+	text := "panic: synthetic\nfatal error: synthetic\ntime=\"fixture\" level=error msg=\"output device failed\" error=\"synthetic panic: private\"\ntime=\"fixture\" level=error msg=\"failed restoring session after logout\" error=\"synthetic\"\n"
+	for n := range []byte(text) {
+		if _, e := w.Write([]byte{text[n]}); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if scan.count != [5]uint16{1, 1, 2, 1, 1} || stopped {
+		t.Fatalf("split fixed-header classification %v stopped=%v", scan.count, stopped)
+	}
+	// Header-like text in an error field is escaped by the actual TextFormatter;
+	// neither embedded panic text nor its field values are emitted or retained.
 }

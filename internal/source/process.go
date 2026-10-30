@@ -48,6 +48,7 @@ type Process struct {
 	exitCode      int
 	exitClass     string
 	stderrLimited atomic.Bool
+	stderrScan    diagnosticScan
 	once          sync.Once
 }
 
@@ -89,7 +90,7 @@ func startProcess(run context.Context, cancel context.CancelFunc, h Helper, args
 	}
 	p := &Process{stdout: reader, cancel: cancel, done: make(chan struct{})}
 	cmd.Stdout = writer
-	cmd.Stderr = &discardLimit{remaining: 4096, cancel: cancel, limited: &p.stderrLimited}
+	cmd.Stderr = &discardLimit{remaining: 4096, cancel: cancel, limited: &p.stderrLimited, scan: &p.stderrScan}
 	if e = cmd.Start(); e != nil {
 		reader.Close()
 		writer.Close()
@@ -161,10 +162,14 @@ func (p *Process) ExitDiagnostic() (string, int) {
 type discardLimit struct {
 	remaining int
 	limited   *atomic.Bool
+	scan      *diagnosticScan
 	cancel    context.CancelFunc
 }
 
 func (w *discardLimit) Write(p []byte) (int, error) {
+	if w.scan != nil {
+		w.scan.feed(p[:min(len(p), w.remaining)])
+	}
 	if len(p) > w.remaining {
 		if w.limited != nil {
 			w.limited.Store(true)
@@ -174,4 +179,51 @@ func (w *discardLimit) Write(p []byte) (int, error) {
 	}
 	w.remaining -= len(p)
 	return len(p), nil
+}
+
+type StderrSummary struct{ Panic, Fatal, Errors, OutputFailures, RestoreFailures uint16 }
+
+func (p *Process) StderrSummary() StderrSummary {
+	select {
+	case <-p.done:
+		c := p.stderrScan.count
+		return StderrSummary{c[0], c[1], c[2], c[3], c[4]}
+	default:
+		return StderrSummary{}
+	}
+}
+
+// Only match fixed diagnostic headers. Retain finite match positions/counts,
+// never bytes, lines, error fields or a hash of private diagnostic text.
+type diagnosticScan struct {
+	started bool
+	match   [5]int
+	count   [5]uint16
+}
+
+var diagnosticPatterns = [5]string{"\npanic: ", "\nfatal error: ", " level=error ", " msg=\"output device failed\"", " msg=\"failed restoring session after logout\""}
+
+func (s *diagnosticScan) feed(p []byte) {
+	if !s.started {
+		s.started = true
+		s.byte('\n')
+	}
+	for _, b := range p {
+		s.byte(b)
+	}
+}
+func (s *diagnosticScan) byte(b byte) {
+	for i, pattern := range diagnosticPatterns {
+		if b == pattern[s.match[i]] {
+			s.match[i]++
+		} else if b == pattern[0] {
+			s.match[i] = 1
+		} else {
+			s.match[i] = 0
+		}
+		if s.match[i] == len(pattern) {
+			s.count[i]++
+			s.match[i] = 0
+		}
+	}
 }

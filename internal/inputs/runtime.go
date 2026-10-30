@@ -28,9 +28,14 @@ type Runtime struct {
 }
 
 func (r *Runtime) Errors() <-chan error { return r.errors }
-func (r *Runtime) fail(class string, slot, exit int) {
+func (r *Runtime) fail(class string, slot, exit int, summaries ...source.StderrSummary) {
+	failure := fmt.Sprintf("input runtime stopped: %s slot=%d exit=%d", class, slot, exit)
+	if len(summaries) > 0 {
+		s := summaries[0]
+		failure += fmt.Sprintf(" stderr_panic=%d stderr_fatal=%d stderr_errors=%d stderr_output=%d stderr_restore=%d", s.Panic, s.Fatal, s.Errors, s.OutputFailures, s.RestoreFailures)
+	}
 	select {
-	case r.errors <- fmt.Errorf("input runtime stopped: %s slot=%d exit=%d", class, slot, exit):
+	case r.errors <- errors.New(failure):
 	default:
 	}
 	r.cancel()
@@ -344,7 +349,11 @@ func (r *Runtime) watchHelper(ctx context.Context, process *source.Process, slot
 				} else if class == "running" {
 					class = "read"
 				}
-				r.fail("spotify_"+class, slot, exit)
+				if class == "stderr_limit" {
+					r.fail("spotify_"+class, slot, exit, process.StderrSummary())
+				} else {
+					r.fail("spotify_"+class, slot, exit)
+				}
 			}
 			return
 		}
