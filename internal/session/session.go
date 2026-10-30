@@ -80,31 +80,33 @@ type Event struct {
 	At     time.Duration `json:"raw_ns"`
 }
 type Status struct {
-	Paused          bool                    `json:"paused"`
-	Resuming        bool                    `json:"resuming"`
-	PositionSample  uint64                  `json:"position_sample"`
-	Epoch           uint64                  `json:"epoch"`
-	Group           string                  `json:"group"`
-	Active          bool                    `json:"active"`
-	Muted           bool                    `json:"muted"`
-	SourceState     string                  `json:"source_state"`
-	SourceTransport string                  `json:"source_transport,omitempty"`
-	Metadata        airplay.Metadata        `json:"metadata"`
-	TargetDB        *float64                `json:"target_db,omitempty"`
-	NextSample      uint64                  `json:"next_sample"`
-	ReplayFrames    uint64                  `json:"replay_frames"`
-	Members         map[string]MemberStatus `json:"members"`
-	Events          []Event                 `json:"events"`
+	QuarantinedDevices []string                `json:"quarantined_devices,omitempty"`
+	Paused             bool                    `json:"paused"`
+	Resuming           bool                    `json:"resuming"`
+	PositionSample     uint64                  `json:"position_sample"`
+	Epoch              uint64                  `json:"epoch"`
+	Group              string                  `json:"group"`
+	Active             bool                    `json:"active"`
+	Muted              bool                    `json:"muted"`
+	SourceState        string                  `json:"source_state"`
+	SourceTransport    string                  `json:"source_transport,omitempty"`
+	Metadata           airplay.Metadata        `json:"metadata"`
+	TargetDB           *float64                `json:"target_db,omitempty"`
+	NextSample         uint64                  `json:"next_sample"`
+	ReplayFrames       uint64                  `json:"replay_frames"`
+	Members            map[string]MemberStatus `json:"members"`
+	Events             []Event                 `json:"events"`
 }
 type Engine struct {
-	op      sync.Mutex
-	mu      sync.Mutex
-	cfg     config.Config
-	clock   Clock
-	offset  int64
-	factory Factory
-	epoch   uint64
-	current *running
+	quarantine []*unresolvedTeardown
+	op         sync.Mutex
+	mu         sync.Mutex
+	cfg        config.Config
+	clock      Clock
+	offset     int64
+	factory    Factory
+	epoch      uint64
+	current    *running
 }
 type running struct {
 	transportMu               sync.Mutex
@@ -136,6 +138,7 @@ type member struct {
 	context       context.Context
 	resumePending bool
 	reconfigure   bool
+	reconfiguring bool
 	attemptDone   chan struct{}
 	id            string
 	state         MemberStatus
@@ -195,6 +198,9 @@ func (e *Engine) Select(sel Selection) (uint64, error) {
 		}
 	}
 	e.stop()
+	if err := e.resolveTeardown(ids); err != nil {
+		return 0, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	recovery, cancelRecovery := context.WithCancel(ctx)
 	firstTime, _ := audio.SampleTime(sel.FirstSample, 48000)
@@ -281,12 +287,13 @@ func (s *running) eventLocked(id, kind string) {
 }
 func (s *running) signalLocked() { close(s.changed); s.changed = make(chan struct{}) }
 func (e *Engine) Status() Status {
+	quarantined := e.quarantineStatus()
 	s := e.currentSession()
 	if s == nil {
-		return Status{SourceState: "idle", Members: map[string]MemberStatus{}}
+		return Status{QuarantinedDevices: quarantined, SourceState: "idle", Members: map[string]MemberStatus{}}
 	}
 	s.mu.Lock()
-	result := Status{Paused: s.paused, Resuming: s.resuming || s.engine.clock.Now() < s.resumeAt, PositionSample: s.positionLocked(), Epoch: s.epoch, Group: s.selection.Group, Active: s.active, Muted: s.muted, SourceState: s.sourceState, SourceTransport: s.sourceTransport, Metadata: s.metadata, NextSample: s.next, Members: map[string]MemberStatus{}, Events: append([]Event(nil), s.events...)}
+	result := Status{QuarantinedDevices: quarantined, Paused: s.paused, Resuming: s.resuming || s.engine.clock.Now() < s.resumeAt, PositionSample: s.positionLocked(), Epoch: s.epoch, Group: s.selection.Group, Active: s.active, Muted: s.muted, SourceState: s.sourceState, SourceTransport: s.sourceTransport, Metadata: s.metadata, NextSample: s.next, Members: map[string]MemberStatus{}, Events: append([]Event(nil), s.events...)}
 	if s.selection.TargetDB != nil {
 		v := *s.selection.TargetDB
 		result.TargetDB = &v

@@ -34,7 +34,7 @@ func (s *running) run() {
 	}
 	s.cancelRecovery()
 	for _, m := range s.members {
-		if m.state.Attempts > 1 && m.state.State == "preparing" && !s.resuming && !m.resumePending && m.cancel != nil {
+		if m.state.Attempts > 1 && m.state.State == "preparing" && !s.resuming && !m.resumePending && !m.reconfiguring && m.cancel != nil {
 			m.cancel()
 		}
 	}

@@ -36,7 +36,13 @@ func (s *running) memberLoop(m *member) {
 				continue
 			}
 		}
-		if recovering && s.sourceState != "reading" && !s.resuming && !m.resumePending {
+		if s.engine.isQuarantined(m.id, s.engine.cfg.Devices[m.id]) {
+			m.state.State = "quarantined"
+			m.state.LastError = "stop_failed"
+			s.mu.Unlock()
+			return
+		}
+		if recovering && s.sourceState != "reading" && !s.resuming && !m.resumePending && !m.reconfigure {
 			m.state.State = "ended"
 			s.mu.Unlock()
 			return
@@ -44,6 +50,7 @@ func (s *running) memberLoop(m *member) {
 		resume := m.resumePending || s.resuming
 		firstResume := s.pausedSample
 		m.resumePending = false
+		m.reconfiguring = m.reconfigure
 		m.reconfigure = false
 		m.attemptDone = make(chan struct{})
 		m.state.Attempts++
@@ -150,7 +157,7 @@ func (s *running) attempt(m *member, first uint64, deadline time.Duration, resum
 	m.context = ctx
 	token := m.state.Attempts
 	done := m.attemptDone
-	if m.reconfigure || s.paused && !s.resuming || token > 1 && s.sourceState != "reading" && !resume {
+	if m.reconfigure || s.paused && !s.resuming || token > 1 && s.sourceState != "reading" && !resume && !m.reconfiguring {
 		cancel()
 	}
 	s.mu.Unlock()
@@ -177,6 +184,9 @@ func (s *running) attempt(m *member, first uint64, deadline time.Duration, resum
 	s.mu.Unlock()
 	defer func() {
 		stopErr := out.Stop()
+		if stopErr != nil {
+			s.engine.quarantineOutput(m.id, req.Device, out)
+		}
 		last := out.Status()
 		s.mu.Lock()
 		if stopErr != nil {

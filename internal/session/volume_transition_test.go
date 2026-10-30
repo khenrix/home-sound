@@ -85,8 +85,12 @@ func bufferedEngine(t *testing.T, ceiling float64) (*Engine, *testClock, *buffer
 	d := &bufferedDevice{pending: map[*bufferedOutput][]float32{}, peak: math.Inf(-1)}
 	cfg := testConfig()
 	cfg.ReferenceCeilingDB = &ceiling
+	device := cfg.Devices["tv"]
+	device.Host = "192.0.2.10"
+	device.Port = 7000
+	cfg.Devices["tv"] = device
 	e, err := New(cfg, c, 1700000000000000000, func(ctx context.Context, r DeviceRequest) (Output, error) {
-		if r.ID == "tv" {
+		if r.Device.Kind == "tv" {
 			return d.create(ctx, r)
 		}
 		return &sink{}, nil
@@ -260,5 +264,81 @@ func TestNativeTransitionAfterSustainedRecoveryGetsFreshBudget(t *testing.T) {
 	})
 	if st := e.Status().Members["kitchen"]; st.State == "recovery_exhausted" || st.Errors != 1 {
 		t.Fatalf("healthy time retained expired recovery deadline: %+v", st)
+	}
+}
+
+func TestExplicitNativeChangeReplaysUnplayedEOFTail(t *testing.T) {
+	e, _, d := bufferedEngine(t, -24)
+	selectSource(t, e, config.TVAndSpeakers, &testSource{limit: 48000})
+	eventually(t, func() bool {
+		return e.Status().SourceState == "ended" && d.latest() != nil && d.latest().Status().Frames == 48000
+	})
+	old := d.latest()
+	anchor := e.PresentationTime(0)
+	if err := e.SetTargetDB(-30); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, func() bool {
+		return d.latest() != old && d.latest().Status().Frames == 48000 || e.Status().Members["tv"].State == "ended"
+	})
+	if d.latest() == old || d.latest().Status().Frames != 48000 {
+		t.Fatalf("volume change dropped EOF tail: %+v", e.Status().Members["tv"])
+	}
+	fresh := d.latest()
+	fresh.mu.Lock()
+	first, native := fresh.first, fresh.native
+	fresh.mu.Unlock()
+	if first != 0 || native != 10 || !e.PresentationTime(0).Equal(anchor) {
+		t.Fatalf("EOF replacement lost its timeline/volume: first=%d native=%d", first, native)
+	}
+}
+
+type heldVolumePreparation struct {
+	Output
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (o *heldVolumePreparation) Prepare(ctx context.Context, epoch, first uint64) error {
+	close(o.entered)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-o.release:
+		return o.Output.Prepare(ctx, epoch, first)
+	}
+}
+func TestEOFDoesNotCancelExplicitVolumePreparation(t *testing.T) {
+	e, c, d := bufferedEngine(t, -24)
+	base := e.factory
+	entered, release := make(chan struct{}), make(chan struct{})
+	var attempts int
+	e.factory = func(ctx context.Context, r DeviceRequest) (Output, error) {
+		out, err := base(ctx, r)
+		if r.Device.Kind == "tv" {
+			attempts++ // One TV worker owns this factory branch.
+			if attempts == 2 {
+				return &heldVolumePreparation{Output: out, entered: entered, release: release}, err
+			}
+		}
+		return out, err
+	}
+	selectSource(t, e, config.TVAndSpeakers, &testSource{limit: 96000})
+	eventually(t, func() bool { return d.latest() != nil && d.latest().Status().Frames == 96000 })
+	old := d.latest()
+	if err := e.SetTargetDB(-30); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("replacement preparation did not begin")
+	}
+	c.advance(20 * time.Millisecond)
+	eventually(t, func() bool { return e.Status().SourceState == "ended" })
+	close(release)
+	eventually(t, func() bool { return d.latest().Status().Frames == 96000 || e.Status().Members["tv"].State == "ended" })
+	if d.latest() == old || d.latest().Status().Frames != 96000 {
+		t.Fatalf("EOF canceled explicit retained-tail preparation: %+v", e.Status().Members["tv"])
 	}
 }
