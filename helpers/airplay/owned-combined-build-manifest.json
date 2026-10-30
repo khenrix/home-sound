@@ -1,0 +1,138 @@
+{
+  "pin": "0a58c239d5fb3cf8927b9707a71c6fe897266b6a",
+  "submodules": [
+    {
+      "path": "libraop",
+      "commit": "81c2182649da8645ac2a58b78e9f370c79a4165b"
+    },
+    {
+      "path": "libraop/crosstools",
+      "commit": "41544c653760a205cbf6cebfdeda4a9394cc6455"
+    },
+    {
+      "path": "libraop/curve25519",
+      "commit": "67472447bc1f4278b7a07b38fdec3aa75f49e799"
+    },
+    {
+      "path": "libraop/dmap-parser",
+      "commit": "2f8ee61e2427a177beea919d72dde8931084fe51"
+    },
+    {
+      "path": "libraop/libcodecs",
+      "commit": "3234c96680fbe9f45047936a14df10edca822e5e"
+    },
+    {
+      "path": "libraop/libcodecs/alac",
+      "commit": "30e526563714325ff384968e116060c4ed606f06"
+    },
+    {
+      "path": "libraop/libcodecs/faac",
+      "commit": "a38aecee0d5cf934f540caebfda8889b848cd668"
+    },
+    {
+      "path": "libraop/libcodecs/faad2",
+      "commit": "3f312db2e6b9f65a0e8d5976303256af70ff714f"
+    },
+    {
+      "path": "libraop/libcodecs/flac",
+      "commit": "c87c4f4514c35eff54e4a08665a380fb43a6c8ea"
+    },
+    {
+      "path": "libraop/libcodecs/mad",
+      "commit": "54f589f78b1da780be742faafe6aa0f8405a5abb"
+    },
+    {
+      "path": "libraop/libcodecs/ogg",
+      "commit": "db5c7a49ce7ebda47b15b78471e78fb7f2483e22"
+    },
+    {
+      "path": "libraop/libcodecs/opus",
+      "commit": "bce1f392353d72d77d543bb2069a044ae1045e9d"
+    },
+    {
+      "path": "libraop/libcodecs/opusenc",
+      "commit": "e4285b5e8c20a06746f656102c5be8aef83f7ccb"
+    },
+    {
+      "path": "libraop/libcodecs/opusfile",
+      "commit": "0a4cd796df5b030cb866f3f4a5e41a4b92caddf5"
+    },
+    {
+      "path": "libraop/libcodecs/shine",
+      "commit": "aa4c0add37e5f4a11ddd4332bd569a0b3f60659a"
+    },
+    {
+      "path": "libraop/libcodecs/soxr",
+      "commit": "ee03a6bb3384d793ada0b1ea7722febbcaa3597d"
+    },
+    {
+      "path": "libraop/libcodecs/vorbis",
+      "commit": "84c023699cdf023a32fa4ded32019f194afcdad0"
+    },
+    {
+      "path": "libraop/libmdns",
+      "commit": "d7f58bf2791c3c25fd729d739a9267ce9db5b696"
+    },
+    {
+      "path": "libraop/libmdns/mdnssd",
+      "commit": "16402f3293b8bf09b8274ba7188202953d8e4f40"
+    },
+    {
+      "path": "libraop/libmdns/mdnssvc",
+      "commit": "314b5d80e36d7becc797f3000a713c8a56444145"
+    },
+    {
+      "path": "libraop/libopenssl",
+      "commit": "ac74d79efc7a702386fcf00d4b7e0a785721a3ed"
+    },
+    {
+      "path": "libraop/libopenssl/openssl",
+      "commit": "8ddacec11481a37302c19f4454e23299af399f83"
+    },
+    {
+      "path": "libraop/libopenssl/openssl/boringssl",
+      "commit": "2070f8ad9151dc8f3a73bffaa146b5e6937a583f"
+    },
+    {
+      "path": "libraop/libopenssl/openssl/krb5",
+      "commit": "890ca2f401924cdcb88f493950b04700bbe52db3"
+    },
+    {
+      "path": "libraop/libopenssl/openssl/pyca-cryptography",
+      "commit": "fa84d185c0fefa7d612759e02a26def2f948fe34"
+    },
+    {
+      "path": "libraop/libopenssl/openssl/wycheproof",
+      "commit": "2196000605e45d91097147c9c71f26b72af58003"
+    },
+    {
+      "path": "libraop/libpthreads4w",
+      "commit": "2ae750783281db5b5cd867649880b3b951ced781"
+    }
+  ],
+  "patch_sha256": {
+    "anchor": "fb7d57b04e45b53da39d79a9f3ed7a9ae2f9a71f29d9732f36a78c3506d64b71",
+    "epoch": "9fe68cd6b76c52f291e08cfed04f2155686cd6afe516b0801c3c4f8ab3983e0f",
+    "owned-ptp": "0e7777e258065d91fe3cdafe252e501ec9df7fa37ab4af07822b1f25378219c1"
+  },
+  "artifacts": {
+    "owned-combined": {
+      "file": "cliairplay-0.5.9-homesound-owned-combined-linux-x86_64",
+      "sha256": "8694f51d07a3304b6a222e2f37f39f4a3a948cbb1c2e136789ba304c674ece55",
+      "version": "0.5.9-homesound-owned-combined",
+      "build_command": [
+        "make",
+        "HOST=linux",
+        "PLATFORM=x86_64",
+        "STATIC=1",
+        "CC=gcc",
+        "CXX=g++",
+        "VERSION=0.5.9-homesound-owned-combined",
+        "LIBCODECS_PATCHED=/home/khenrix/git/home-sound/.superpowers/sdd/2026-10-29-home-sound/owned-combined-build-final/owned-combined/build/libcodecs_patched.a",
+        "EXTRA_CFLAGS=-ffile-prefix-map=/home/khenrix/git/home-sound/.superpowers/sdd/2026-10-29-home-sound/owned-combined-build-final=.",
+        "-j2"
+      ]
+    }
+  },
+  "compiler": "gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0"
+}

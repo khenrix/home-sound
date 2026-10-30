@@ -66,3 +66,26 @@ and the upstream notices. Keep the build's source directory with any distributio
 Upstream's notices explicitly identify an unresolved license-grant ambiguity
 for libraop `pairing.cpp` and `bplist.cpp`; these patches do not resolve or hide
 that existing upstream issue. No upstream publication is performed here.
+
+## Strict owned PTP candidate
+
+`owned-ptp.patch` adds validated `--ptp-shm-name /hs-…`,
+`--ptp-control-port PORT`, and `--ptp-shared-required` arguments. Endpoint settings
+are fixed before threads start. Required mode refuses independent NTP/PTP
+engines if private shared attachment fails. The daemon exclusively creates its
+shared-memory object and its UDP ports. A crash orphan is preserved; the Go
+manager chooses a fresh private namespace for the next generation. The actual C
+fixtures cover unknown/stale objects, restart, strict fallback prevention,
+namespace validation, duplicate binding and a foreign reusable UDP socket.
+
+```
+python3 helpers/airplay/build.py --owned-ptp /path/to/canonical/airplay-cli /new/owned-directory
+python3 helpers/airplay/build.py --owned-ptp --combined /path/to/canonical/airplay-cli /new/owned-combined-directory
+```
+
+The first leaves NTP behavior at the release baseline and is named
+`0.5.9-homesound-owned-ptp`; the second includes both experimental NTP patches.
+The original three Stage-A candidates remain separately recorded in
+`build-manifest.json`; the owned candidate is in `owned-build-manifest.json`.
+Select every candidate explicitly by path and exact checksum. No privileged
+setup, live playback or acoustic validation is performed by this recipe.

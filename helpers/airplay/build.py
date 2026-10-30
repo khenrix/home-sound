@@ -31,6 +31,8 @@ def export(repo, pin, dest, pins):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--owned-ptp', action='store_true', help='build strict owned PTP only, leaving NTP baseline unchanged')
+    parser.add_argument('--combined', action='store_true', help='with --owned-ptp also apply both experimental NTP patches')
     parser.add_argument('canonical_checkout', type=pathlib.Path)
     parser.add_argument('new_output_directory', type=pathlib.Path)
     args=parser.parse_args();os.umask(0o022)
@@ -39,18 +41,24 @@ def main():
     if git(source,'rev-parse','v0.5.9^{commit}').decode().strip()!=PIN: parser.error('tag does not match the pinned release')
     out.mkdir(parents=True);pins=[];baseline=out/'source'
     export(source,PIN,baseline,pins)
-    patches={name:hashlib.sha256((HERE/'patches'/f'{name}.patch').read_bytes()).hexdigest() for name in ('anchor','epoch')}
+    patch_names=('anchor','epoch','owned-ptp') if args.owned_ptp else ('anchor','epoch')
+    patches={name:hashlib.sha256((HERE/'patches'/f'{name}.patch').read_bytes()).hexdigest() for name in patch_names}
     manifest={'pin':PIN,'submodules':[dict(path=str(pathlib.Path(p['path']).relative_to(baseline)),commit=p['commit']) for p in pins], 'patch_sha256':patches,'artifacts':{},'compiler':subprocess.check_output(['gcc','--version']).decode().splitlines()[0]}
-    for name in ('anchor','epoch','combined'):
+    variants=('owned-combined' if args.combined else 'owned-ptp',) if args.owned_ptp else ('anchor','epoch','combined')
+    for name in variants:
         dest=out/name
         shutil.copytree(baseline,dest,ignore=lambda path,names: ['libraop'] if pathlib.Path(path)==baseline else [])
         (dest/'libraop').symlink_to('../source/libraop',target_is_directory=True)
-        selected=('anchor','epoch') if name=='combined' else (name,)
+        selected=('owned-ptp','anchor','epoch') if name=='owned-combined' else ('anchor','epoch') if name=='combined' else (name,)
         for patch in selected:
             with (HERE/'patches'/f'{patch}.patch').open('rb') as f: run(['patch','--batch','--fuzz=0','-p1'],cwd=dest,stdin=f)
-        run(['python3',str(HERE/'tests/run.py'),str(dest),name])
-        if name=='combined': run(['python3',str(HERE/'tests/run.py'),str(dest),'epoch'])
-        version='0.5.9-homesound-ntp-'+name
+        if name.startswith('owned-'):
+            run(['python3',str(HERE/'tests/owner.py'),str(dest),'patched'])
+            run(['python3',str(HERE/'tests/required.py'),str(dest),'patched'])
+            run(['python3',str(HERE/'tests/required.py'),str(dest),'ports'])
+        if name!='owned-ptp': run(['python3',str(HERE/'tests/run.py'),str(dest),'combined' if name=='owned-combined' else name])
+        if name in ('combined','owned-combined'): run(['python3',str(HERE/'tests/run.py'),str(dest),'epoch'])
+        version='0.5.9-homesound-'+('' if name.startswith('owned-') else 'ntp-')+name
         command=['make','HOST=linux','PLATFORM=x86_64','STATIC=1','CC=gcc','CXX=g++','VERSION='+version,'LIBCODECS_PATCHED='+str(dest/'build/libcodecs_patched.a'),'EXTRA_CFLAGS=-ffile-prefix-map='+str(out)+'=.', '-j2']
         (dest/'build').mkdir(exist_ok=True)
         # Upstream libcodecs is a thin archive; materialize it before moving.

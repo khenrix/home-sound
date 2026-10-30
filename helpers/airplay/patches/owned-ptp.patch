@@ -1,0 +1,272 @@
+--- a/src/ap2_ptp_shm.h
++++ b/src/ap2_ptp_shm.h
+@@ -95,6 +95,12 @@
+     struct ap2_ptp_shm_sample main;
+     struct ap2_ptp_shm_sample secondary;
+ };
++
++/* Home Sound: configure a private endpoint before starting any threads.
++ * Names are /hs- plus ASCII letters/digits/hyphens, at most 30 bytes. */
++bool ap2_ptp_set_endpoint(const char *name, unsigned port);
++void ap2_ptp_require_shared(void);
++bool ap2_ptp_shared_required(void);
+ 
+ /* ---- writer (daemon side) ---- */
+ 
+--- a/src/ap2_ptp_shm.c
++++ b/src/ap2_ptp_shm.c
+@@ -28,6 +28,25 @@
+ 
+ extern log_level *loglevel;
+ 
++/* Modified by Home Sound: each owned daemon generation has a private name
++ * and control port. These options are immutable once threads are started. */
++static char ptp_shm_name[32] = AP2_PTP_SHM_NAME;
++static unsigned ptp_ctrl_port = AP2_PTP_CTRL_PORT;
++static bool ptp_required = false;
++bool ap2_ptp_set_endpoint(const char *name, unsigned port)
++{
++    if (!name || strlen(name) < 5 || strlen(name) > 30 ||
++        strncmp(name, "/hs-", 4) || port < 1024 || port > 65535) return false;
++    for (const char *p = name + 4; *p; p++)
++        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
++              (*p >= '0' && *p <= '9') || *p == '-')) return false;
++    strcpy(ptp_shm_name, name);
++    ptp_ctrl_port = port;
++    return true;
++}
++void ap2_ptp_require_shared(void) { ptp_required = true; }
++bool ap2_ptp_shared_required(void) { return ptp_required; }
++
+ /* ---- shared-memory writer (daemon side) ---- */
+ 
+ bool ap2_ptp_shm_writer_open(struct ap2_ptp_shm_writer *w)
+@@ -36,40 +55,18 @@
+     memset(w, 0, sizeof(*w));
+     w->fd = -1;
+ 
+-    /* O_CREAT|O_RDWR: reattach a stale object left by a crashed daemon (same
+-     * size) rather than failing; we re-stamp the version and overwrite. */
++    /* Never reuse, unlink, or resize an object belonging to another process,
++     * including an orphan. A new daemon generation uses a new private name. */
+     bool created = true;
+-    int fd = shm_open(AP2_PTP_SHM_NAME, O_CREAT | O_EXCL | O_RDWR, 0644);
+-    if (fd < 0 && errno == EEXIST) {
+-        created = false;
+-        fd = shm_open(AP2_PTP_SHM_NAME, O_CREAT | O_RDWR, 0644);
+-    }
+-    if (fd < 0) {
+-        LOG_ERROR("[PTP-SHM] shm_open(%s) failed: %s", AP2_PTP_SHM_NAME, strerror(errno));
+-        return false;
+-    }
+-
+-    /* A stale object from an older layout can be smaller than this one.
+-     * Resizing an existing object is undefined on some platforms, so replace
+-     * it instead of growing it. */
+-    struct stat st;
+-    if (!created && fstat(fd, &st) == 0 && st.st_size < (off_t)sizeof(struct ap2_ptp_shm)) {
+-        close(fd);
+-        shm_unlink(AP2_PTP_SHM_NAME);
+-        fd = shm_open(AP2_PTP_SHM_NAME, O_CREAT | O_EXCL | O_RDWR, 0644);
+-        if (fd < 0) {
+-            LOG_ERROR("[PTP-SHM] shm_open(%s) failed: %s", AP2_PTP_SHM_NAME, strerror(errno));
+-            return false;
+-        }
+-        created = true;
+-    }
++    int fd = shm_open(ptp_shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);
++    if (fd < 0) return false;
+ 
+     /* ftruncate is only meaningful when we just created the object; sizing an
+      * existing mapping down/up is undefined on some platforms, so guard it. */
+     if (created && ftruncate(fd, sizeof(struct ap2_ptp_shm)) != 0) {
+         LOG_ERROR("[PTP-SHM] ftruncate failed: %s", strerror(errno));
+         close(fd);
+-        shm_unlink(AP2_PTP_SHM_NAME);
++        shm_unlink(ptp_shm_name);
+         return false;
+     }
+ 
+@@ -78,7 +75,7 @@
+     if (map == MAP_FAILED) {
+         LOG_ERROR("[PTP-SHM] mmap failed: %s", strerror(errno));
+         close(fd);
+-        if (created) shm_unlink(AP2_PTP_SHM_NAME);
++        if (created) shm_unlink(ptp_shm_name);
+         return false;
+     }
+ 
+@@ -92,7 +89,7 @@
+     w->map->version = AP2_PTP_SHM_VERSION;
+     __sync_synchronize();
+ 
+-    LOG_INFO("[PTP-SHM] Publishing clock at %s (%s, %zu bytes)", AP2_PTP_SHM_NAME,
++    LOG_INFO("[PTP-SHM] Publishing clock at %s (%s, %zu bytes)", ptp_shm_name,
+              created ? "created" : "reattached", sizeof(struct ap2_ptp_shm));
+     return true;
+ }
+@@ -115,7 +112,7 @@
+     if (!w) return;
+     if (w->map) { munmap(w->map, sizeof(struct ap2_ptp_shm)); w->map = NULL; }
+     if (w->fd >= 0) { close(w->fd); w->fd = -1; }
+-    if (w->owner) shm_unlink(AP2_PTP_SHM_NAME);
++    if (w->owner) shm_unlink(ptp_shm_name);
+ }
+ 
+ /* ---- shared-memory reader (streaming side) ---- */
+@@ -126,7 +123,7 @@
+     memset(r, 0, sizeof(*r));
+     r->fd = -1;
+ 
+-    int fd = shm_open(AP2_PTP_SHM_NAME, O_RDONLY, 0);
++    int fd = shm_open(ptp_shm_name, O_RDONLY, 0);
+     if (fd < 0) return false;   /* no daemon */
+ 
+     /* An object the daemon has created but not yet sized has no backing for
+@@ -199,12 +196,12 @@
+ 
+     struct sockaddr_in a = {
+         .sin_family = AF_INET,
+-        .sin_port = htons(AP2_PTP_CTRL_PORT),
++        .sin_port = htons(ptp_ctrl_port),
+     };
+     a.sin_addr.s_addr = inet_addr(AP2_PTP_CTRL_ADDR);   /* loopback only */
+     if (bind(s, (struct sockaddr *)&a, sizeof(a)) < 0) {
+         LOG_ERROR("[PTP-SHM] control bind %s:%d failed: %s", AP2_PTP_CTRL_ADDR,
+-                  AP2_PTP_CTRL_PORT, strerror(errno));
++                  ptp_ctrl_port, strerror(errno));
+         close(s);
+         return -1;
+     }
+@@ -224,7 +221,7 @@
+ 
+     struct sockaddr_in dst = {
+         .sin_family = AF_INET,
+-        .sin_port = htons(AP2_PTP_CTRL_PORT),
++        .sin_port = htons(ptp_ctrl_port),
+     };
+     dst.sin_addr.s_addr = inet_addr(AP2_PTP_CTRL_ADDR);
+ 
+--- a/src/ap2_ptp.c
++++ b/src/ap2_ptp.c
+@@ -638,12 +638,8 @@
+     int s = socket(AF_INET, SOCK_DGRAM, 0);
+     if (s < 0) return -1;
+ 
+-    /* SO_REUSEADDR is the usual requirement for binding a multicast port; we do
+-     * NOT set SO_REUSEPORT, so a second cliairplay that also tries PTP fails to
+-     * bind here and falls back to NTP rather than silently co-binding as a
+-     * competing grandmaster (only one process owns 319/320 for now). */
+-    int yes = 1;
+-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
++    /* Home Sound: exclusive binding; SO_REUSEADDR permits duplicate UDP
++     * binders on Linux even without SO_REUSEPORT. */
+ 
+     /* Bind INADDR_ANY:port. Binding a specific unicast address would stop the
+      * kernel from delivering datagrams sent to the multicast group on BSD and
+@@ -1258,6 +1254,8 @@
+ 
+ bool ap2_ptp_start(struct ap2_ptp_ctx *ctx, const char *device_ip)
+ {
++    /* Home Sound strict shared routes never start an independent responder. */
++    if (ap2_ptp_shared_required()) return false;
+     if (!ctx) return false;
+     if (device_ip) ctx->device_ip = strdup(device_ip);
+ 
+@@ -1389,6 +1387,7 @@
+ bool ap2_ptp_engine_start(struct ap2_ptp_ctx *ctx, struct in_addr bind_addr,
+                           const char *device_ip)
+ {
++    if (ap2_ptp_shared_required()) return false;
+     if (!ctx) return false;
+     if (device_ip && !ctx->device_ip) ctx->device_ip = strdup(device_ip);
+     if (device_ip) inet_pton(AF_INET, device_ip, &ctx->own_receiver);
+--- a/src/ap2_client.c
++++ b/src/ap2_client.c
+@@ -54,6 +54,7 @@
+ #include "ap2_plist.h"
+ #include "ap2_bplist.h"
+ #include "ap2_ptp.h"
++#include "ap2_ptp_shm.h"
+ #include "raop_session.h"
+ #include "ap2_timeline.h"
+ 
+@@ -2012,6 +2013,10 @@
+             p->use_ptp = true;
+             ap2_ptp_shared_register(p->ptp, p->device.address, follow);
+             ap2_ptp_engine_settle(p->ptp, 400);
++        } else if (p->ptp_shared && ap2_ptp_shared_required()) {
++            ap2_set_connect_error(p, AP2_CONNECT_ERROR_GENERIC, 0,
++                                  "%s", "required shared PTP unavailable");
++            return false;
+         } else if ((follow ? ap2_ptp_follow_receiver(p->ptp, p->device.address) : true) &&
+                    ap2_ptp_engine_start(p->ptp, p->bind_addr, p->device.address)) {
+             p->use_ptp = true;
+--- a/src/cliairplay.c
++++ b/src/cliairplay.c
+@@ -39,6 +39,7 @@
+ #include "ap2_session.h"
+ #include "ap2_io.h"
+ #include "ap2_ptp.h"
++#include "ap2_ptp_shm.h"
+ #include "ap2_hap.h"
+ #include "raop_session.h"
+ #include "artwork.h"
+@@ -2168,6 +2169,9 @@
+     printf("                             read the elected clock from shared memory and do\n");
+     printf("                             not bind 319/320 when a daemon is present; else\n");
+     printf("                             fall back to the in-process engine\n");
++    printf("  --ptp-shm-name <name>      Home Sound private /hs- namespace (max 30 bytes)\n");
++    printf("  --ptp-control-port <port> Home Sound private loopback control port\n");
++    printf("  --ptp-shared-required     Fail if private shared PTP cannot attach\n");
+     printf("  --ptp-daemon               Run ONLY the shared PTP clock: bind 319/320 once,\n");
+     printf("                             publish the elected master to shared memory, and\n");
+     printf("                             serve the control channel until signaled. One per\n");
+@@ -2242,6 +2246,9 @@
+         {"buffered",     no_argument,       0, 1010},
+         {"ptp-daemon",   no_argument,       0, 1011},
+         {"ptp-shared",   no_argument,       0, 1012},
++        {"ptp-shm-name", required_argument, 0, 1016},
++        {"ptp-control-port", required_argument, 0, 1017},
++        {"ptp-shared-required", no_argument, 0, 1018},
+         {"check",        no_argument,       0, 1002},
+         {"pair",         no_argument,       0, 1003},
+         {"pair-setup",   no_argument,       0, 1013},
+@@ -2252,6 +2259,8 @@
+ 
+     setvbuf(stderr, NULL, _IONBF, 0);  /* Unbuffered stderr for status output */
+ 
++    const char *ptp_name = NULL;
++    unsigned ptp_port = 0;
+     int opt;
+     while ((opt = getopt_long(argc, argv, "hP:p:v:l:D:R:C:U:r:b:c:d:es:x:I:E:M:A:K:W:T:n:H:t:",
+                               long_options, NULL)) != -1) {
+@@ -2303,6 +2312,14 @@
+         case 1011: ptp_daemon_mode = true; break;
+         case 1013: pair_setup_mode = true; break;
+         case 1012: cfg.ptp_shared = true; break;
++        case 1016: ptp_name = optarg; break;
++        case 1017: {
++            char *end; errno = 0;
++            unsigned long n = strtoul(optarg, &end, 10);
++            if (errno || end == optarg || *end || n < 1024 || n > 65535) return 1;
++            ptp_port = (unsigned)n; break;
++        }
++        case 1018: cfg.ptp_shared = true; ap2_ptp_require_shared(); break;
+         case 1015: {
+             char *end = NULL;
+             errno = 0;
+@@ -2325,6 +2342,13 @@
+             print_usage(argv[0]);
+             return opt == 'h' ? 0 : 1;
+         }
++    }
++
++    if ((ptp_name || ptp_port) && !ap2_ptp_set_endpoint(ptp_name, ptp_port)) {
++        fprintf(stderr, "Invalid private PTP endpoint\n"); return 1;
++    }
++    if (ap2_ptp_shared_required() && (!ptp_name || cfg.timing != AP2_TIMING_PTP || ptp_daemon_mode)) {
++        fprintf(stderr, "Required shared PTP needs private endpoint and --timing ptp\n"); return 1;
+     }
+ 
+     /* The only streaming positional argument is the target host. */

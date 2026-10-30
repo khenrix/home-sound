@@ -49,12 +49,13 @@ int main(int argc, char **argv) {
         }
     } else {
         /* Different queue heads and wall clocks must announce one content line. */
-        const uint64_t ahead[]={24000,57600,28800};
-        const uint32_t want_sec[]={998,999,998};
-        const uint32_t want_frac[]={3221225472U,1932735283U,3650722201U};
-        for(unsigned i=0;i<3;i++) {
+        const uint64_t ahead[]={24000,57600,28800,144000};
+        const uint32_t want_sec[]={998,999,998,1001};
+        const uint32_t want_frac[]={3221225472U,1932735283U,3650722201U,1073741824U};
+        const uint32_t want_rtp[]={4294871396U,4294904996U,4294876196U,24100U};
+        for(unsigned i=0;i<4;i++) {
             p.head_ts=start_frame+ahead[i];
-            p.rtp_timestamp=100; // force modulo wrap independently of pure scheduling head
+            p.rtp_timestamp=100+(uint32_t)(ahead[i]-24000); // one fixed RTP origin
             now_ntp=(999ULL+i*11)<<32;
             uint8_t pkt[20];
             assert(ap2_send_sync_packet(&p,i==0)==AP2_SEND_SENT);
@@ -63,10 +64,10 @@ int main(int argc, char **argv) {
             if(!strcmp(argv[1],"combined")) sec-=2208988800U;
             /* Fixed-point subtraction may round one tick upward (<0.24ns). */
             int64_t fraction_error=(int64_t)word(pkt+12)-want_frac[i];
-            if(word(pkt+4)!=4294871396U || sec!=want_sec[i] || fraction_error<0 || fraction_error>1) {
+            if(word(pkt+4)!=want_rtp[i] || sec!=want_sec[i] || fraction_error<0 || fraction_error>1) {
                 fprintf(stderr,"FAIL frozen line at queue=%llu: RTP=%u time=%u/%u\n",(unsigned long long)ahead[i],word(pkt+4),sec,word(pkt+12)); return 1;
             }
-            assert(word(pkt+16)==100);
+            assert(word(pkt+16)==p.rtp_timestamp);
             assert(pkt[0]==(i?0x80:0x90) && pkt[1]==0xd4);
         }
     }
