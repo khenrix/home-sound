@@ -201,10 +201,12 @@ silently converted into another item or successful PCM.
 - FFmpeg n9.0.2: `946fcce07b6dcd0331c8cc609192aeff5e1924f8`. Provision a separately
   hashed build with its actual build configuration, licenses and dependencies.
   Runtime configuration accepts the exact release spellings `9.0.2` and `n9.0.2`;
-  the configured spelling must match the binary version output. The local decoding fixture uses the
-  installed GPL-enabled `8.0.1-3ubuntu2`; it does not establish a 9.0.2 deployment
-  build. Its SHA-256 is
-  `bdf6aabffdba7411edff8d36c389d695257fcdf823d196020176e117612862f6`.
+  the configured spelling must match the binary version output. The actual codec
+  test discovers `ffmpeg` on PATH, hashes it and measures its version; absence is
+  a failure. CI builds this pinned canonical source with only HTTP/WAV/PCM fixture
+  capabilities. That minimal build does not establish TLS/AAC/Opus deployment
+  support. The same test also rejects a deliberately incorrect version before
+  fetching media; production version and artifact checks remain unchanged.
 - plaincast `778493916bbd71a85c8457c35dcc33641805a1e6`: permissive protocol
   adaptation; BSD-2-Clause notice in `internal/youtube/NOTICE`. Unknown-license
   yt-cast code was behavior evidence only and was not copied.

@@ -8,5 +8,17 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.3'
-      - run: go test -race ./...
+      - name: Build pinned actual decoder fixture
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config
+          git clone --depth 1 --branch n9.0.2 https://github.com/FFmpeg/FFmpeg.git "$RUNNER_TEMP/ffmpeg-fixture"
+          cd "$RUNNER_TEMP/ffmpeg-fixture"
+          test "$(git rev-parse HEAD)" = 946fcce07b6dcd0331c8cc609192aeff5e1924f8
+          ./configure --disable-everything --disable-autodetect --disable-doc --disable-debug --disable-x86asm --disable-ffplay --disable-ffprobe --enable-ffmpeg --enable-protocol=http,tcp,pipe --enable-demuxer=wav --enable-muxer=pcm_f32le --enable-decoder=pcm_f32le,pcm_s16le --enable-encoder=pcm_f32le --enable-filter=aresample,aformat,anull
+          make -j2 ffmpeg
+          ./ffmpeg -version
+          sha256sum ffmpeg
+          echo "$RUNNER_TEMP/ffmpeg-fixture" >> "$GITHUB_PATH"
+      - run: go test -race -count=1 ./...
       - run: go vet ./...

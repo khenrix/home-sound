@@ -15,8 +15,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -91,13 +93,51 @@ func TestActualFFmpegDecodesBoundedPublicTransportFixture(t *testing.T) {
 	if e := wave.Write(&wav, audio.Canonical, samples); e != nil {
 		t.Fatal(e)
 	}
+	var requests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
 		w.Header().Set("Content-Type", "audio/wav")
 		w.Write(wav.Bytes())
 	}))
 	defer srv.Close()
-	d := Decoder{Helper: pinnedFile(t, "/usr/bin/ffmpeg"), Version: "8.0.1-3ubuntu2"}
-	p, e := d.Decode(context.Background(), Media{url: srv.URL, Duration: time.Second, Metadata: airplay.Metadata{ArtworkID: "youtube:video:abcdefghijk", ArtworkURL: "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg"}}, 0)
+	path, e := exec.LookPath("ffmpeg")
+	if e != nil {
+		t.Fatal("actual decoding fixture requires ffmpeg on PATH: install a supported FFmpeg or use the pinned CI fixture build")
+	}
+	path, e = filepath.Abs(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	// Pin the available codec fixture for this run; deployment pins remain separate.
+	helper := pinnedFile(t, path)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	output, e := helperResult(ctx, helper, []string{"-version"}, 8192)
+	if e != nil {
+		t.Fatal(e)
+	}
+	fields := strings.Fields(strings.SplitN(string(output), "\n", 2)[0])
+	if len(fields) < 3 || fields[0] != "ffmpeg" || fields[1] != "version" {
+		t.Fatal("unrecognized FFmpeg version output")
+	}
+	d := Decoder{Helper: helper, Version: fields[2]}
+	t.Logf("actual codec fixture: path=%s version=%s sha256=%s", helper.Path, d.Version, helper.SHA256)
+	media := Media{url: srv.URL, Duration: time.Second, Metadata: airplay.Metadata{ArtworkID: "youtube:video:abcdefghijk", ArtworkURL: "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg"}}
+	t.Run("wrong_version_refused", func(t *testing.T) {
+		wrong := d
+		wrong.Version += "-unexpected"
+		p, e := wrong.Decode(ctx, media, 0)
+		if p != nil {
+			p.Close()
+		}
+		if e == nil || e.Error() != "pinned FFmpeg version unavailable" {
+			t.Fatalf("wrong version was not refused: %v", e)
+		}
+		if requests.Load() != 0 {
+			t.Fatal("wrong-version decoder fetched media")
+		}
+	})
+	p, e := d.Decode(ctx, media, 0)
 	if e != nil {
 		t.Fatalf("decoder: %v", e)
 	}
