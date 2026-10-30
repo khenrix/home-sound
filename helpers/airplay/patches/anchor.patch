@@ -1,0 +1,32 @@
+--- a/src/ap2_client.c
++++ b/src/ap2_client.c
+@@ -2482,13 +2482,25 @@
+     pkt[3] = 0x07;
+ 
+     uint32_t latency_frames = MS2TS(p->lead_ms, p->format.sample_rate);
+-    uint32_t ts_latency = p->rtp_timestamp >= latency_frames
+-                          ? p->rtp_timestamp - latency_frames : 0;
++    uint32_t ts_latency = p->rtp_timestamp - latency_frames;
+     uint32_t ts_be = htonl(ts_latency);
+     memcpy(pkt + 4, &ts_be, 4);
+ 
+-    /* NTP time */
+-    uint64_t ntp = raopcl_get_ntp(NULL);
++    /* Modified by Home Sound: map the announced sample onto the commanded
++     * content line, independently of the sender's current queue depth.
++     * Internal fixed-point time remains Unix-epoch; RTP arithmetic wraps. */
++    if (!p->start_ntp) {
++        atomic_store(&p->media_healthy, false);
++        return AP2_SEND_FATAL;
++    }
++    int64_t frames = (int64_t)p->head_ts
++                   - (int64_t)NTP2TS(p->start_ntp, p->format.sample_rate)
++                   - (int64_t)latency_frames;
++    uint64_t magnitude = frames < 0 ? (uint64_t)(-frames) : (uint64_t)frames;
++    uint64_t delta = ((magnitude / p->format.sample_rate) << 32)
++                   + ((magnitude % p->format.sample_rate) << 32)
++                     / p->format.sample_rate;
++    uint64_t ntp = frames < 0 ? p->start_ntp - delta : p->start_ntp + delta;
+     uint32_t ntp_sec = htonl((uint32_t)(ntp >> 32));
+     uint32_t ntp_frac = htonl((uint32_t)(ntp & 0xFFFFFFFF));
+     memcpy(pkt + 8, &ntp_sec, 4);

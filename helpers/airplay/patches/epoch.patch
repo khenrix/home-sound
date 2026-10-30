@@ -1,0 +1,7 @@
+--- a/src/ap2_client.c
++++ b/src/ap2_client.c
+@@ -2492 +2492,3 @@
+-    uint32_t ntp_sec = htonl((uint32_t)(ntp >> 32));
++    /* Modified by Home Sound: only the wire uses the NTP 1900 epoch,
++     * matching the native timing responder. START remains Unix time. */
++    uint32_t ntp_sec = htonl((uint32_t)(ntp >> 32) + 2208988800U);
