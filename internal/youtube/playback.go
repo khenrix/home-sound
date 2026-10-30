@@ -37,6 +37,7 @@ type PlaybackController struct {
 	lastError    string
 	volumeDirty  bool
 	muteDirty    bool
+	position     time.Duration
 }
 
 func NewPlaybackController(group, nonce string, co *source.Coordinator, r MediaResolver, d MediaDecoder, target float64) *PlaybackController {
@@ -49,7 +50,8 @@ func (p *PlaybackController) Handle(ctx context.Context, m Message) error {
 		return errors.New("input closed")
 	}
 	if m.Name == "__local_eof" {
-		if !p.ended.CompareAndSwap(p.gen, 0) || !p.co.Current(p.lease) {
+		present, ok := p.presentationLocked()
+		if !ok || !present.Complete || !p.ended.CompareAndSwap(p.gen, 0) || !p.co.Current(p.lease) {
 			return nil
 		}
 		m.Name = "next"
@@ -64,6 +66,7 @@ func (p *PlaybackController) Handle(ctx context.Context, m Message) error {
 			p.cancel()
 		}
 		p.gen++
+		p.position = a.Position
 		p.current.Store(p.gen)
 		run, cancel := context.WithCancel(ctx)
 		p.cancel = cancel
@@ -148,8 +151,8 @@ func (p *PlaybackController) prepare(ctx context.Context, l source.Lease, a Acti
 		p.co.End(l)
 		return
 	}
-	s := &observedSource{Source: prepared, first: &first, position: a.Position, observe: func(pos time.Duration, end bool, failed bool) {
-		if p.current.Load() == l.Generation && p.q.ObservedGeneration(l.Generation, pos, end || failed) {
+	s := &observedSource{Source: prepared, first: &first, observe: func(end bool, failed bool) {
+		if p.current.Load() == l.Generation {
 			if failed {
 				p.failed.Store(l.Generation)
 			} else if end {
@@ -177,6 +180,7 @@ func (p *PlaybackController) prepare(ctx context.Context, l source.Lease, a Acti
 func (p *PlaybackController) Snapshot() (Playback, string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.presentationLocked()
 	if p.gen != 0 && p.failed.Load() == p.gen {
 		return p.q.Snapshot(), "media decoder failed"
 	}
@@ -196,10 +200,8 @@ func (p *PlaybackController) Close() {
 
 type observedSource struct {
 	session.Source
-	first    *audio.Frame
-	position time.Duration
-	frames   uint64
-	observe  func(time.Duration, bool, bool)
+	first   *audio.Frame
+	observe func(bool, bool)
 }
 
 func (s *observedSource) Read(ctx context.Context) (audio.Frame, error) {
@@ -211,10 +213,7 @@ func (s *observedSource) Read(ctx context.Context) (audio.Frame, error) {
 	} else {
 		f, e = s.Source.Read(ctx)
 	}
-	if e == nil {
-		s.frames += uint64(len(f.Data) / 2)
-	}
-	s.observe(s.position+time.Duration(s.frames)*time.Second/48000, errors.Is(e, io.EOF), e != nil && !errors.Is(e, io.EOF) && ctx.Err() == nil)
+	s.observe(errors.Is(e, io.EOF), e != nil && !errors.Is(e, io.EOF) && ctx.Err() == nil)
 	return f, e
 }
 func (s *observedSource) BufferedSamples() uint64 { return 48000 }
@@ -231,4 +230,12 @@ func (p *PlaybackController) InitialVolume(v int) {
 	}
 	p.q.initialVolume(v)
 	p.volumeDirty = v == 0
+}
+
+func (p *PlaybackController) presentationLocked() (source.Presentation, bool) {
+	s, ok := p.co.Presentation(p.lease)
+	if ok {
+		p.q.PresentedGeneration(p.gen, p.position+time.Duration(s.Sample)*time.Second/48000, s.Complete || s.Failed, s.Paused, s.Buffering)
+	}
+	return s, ok
 }

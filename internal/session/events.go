@@ -2,7 +2,6 @@ package session
 
 import (
 	"github.com/khenrix/home-sound/internal/airplay"
-	"strings"
 )
 
 // EventSource is optional. Events describes metadata and source transport state;
@@ -41,12 +40,7 @@ func (s *running) sourceEvents(events <-chan SourceEvent) {
 			s.mu.Lock()
 			switch event.Kind {
 			case "metadata":
-				valid := true
-				for _, v := range []string{event.Metadata.Title, event.Metadata.Artist, event.Metadata.Album} {
-					if len(v) > 1024 || strings.ContainsAny(v, "\r\n\x00") {
-						valid = false
-					}
-				}
+				valid := event.Metadata.Validate() == nil
 				if valid {
 					s.metadata = event.Metadata
 					for _, m := range s.members {

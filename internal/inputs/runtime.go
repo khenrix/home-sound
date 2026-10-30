@@ -77,7 +77,7 @@ func Start(parent context.Context, c Config, co *source.Coordinator, probe bool)
 				return nil, e
 			}
 		}
-		if c.YouTube.DecoderVersion != "9.0.2" {
+		if !deploymentDecoderVersion(c.YouTube.DecoderVersion) {
 			return nil, errors.New("deployment decoder must be pinned FFmpeg 9.0.2")
 		}
 	}
@@ -108,8 +108,8 @@ func Start(parent context.Context, c Config, co *source.Coordinator, probe bool)
 	}
 	return r, nil
 }
-func SpotifyYAML(id Identity, socket string, port, initial int) []byte {
-	return []byte(fmt.Sprintf("log_level: error\ndevice_name: %s\ndevice_id: %s\naudio_backend: framed\naudio_output_pipe: %s\naudio_output_pipe_format: f32le\nexternal_volume: true\nmixer_device: ''\nvolume_steps: 100\ninitial_volume: %d\nignore_last_volume: true\ncrossfade_duration: 0\nnormalisation_disabled: true\ndisable_autoplay: true\ncache:\n  enabled: false\nmetadata:\n  enabled: false\nserver:\n  enabled: true\n  address: 127.0.0.1\n  port: %d\n", strconv.Quote(id.Group), strconv.Quote(id.DeviceID), strconv.Quote(socket), initial, port))
+func SpotifyYAML(id Identity, socket string, port, initial, zeroconfPort int) []byte {
+	return []byte(fmt.Sprintf("log_level: error\ndevice_name: %s\ndevice_id: %s\nzeroconf_port: %d\naudio_backend: framed\naudio_output_pipe: %s\naudio_output_pipe_format: f32le\nexternal_volume: true\nmixer_device: ''\nvolume_steps: 100\ninitial_volume: %d\nignore_last_volume: true\ncrossfade_duration: 0\nnormalisation_disabled: true\ndisable_autoplay: true\ncache:\n  enabled: false\nmetadata:\n  enabled: false\nserver:\n  enabled: true\n  address: 127.0.0.1\n  port: %d\n", strconv.Quote(id.Group), strconv.Quote(id.DeviceID), zeroconfPort, strconv.Quote(socket), initial, port))
 }
 func (r *Runtime) spotify(ctx context.Context, c Config, id Identity, n int, co *source.Coordinator, target float64) error {
 	dir := filepath.Join(id.Dir, "spotify")
@@ -122,7 +122,21 @@ func (r *Runtime) spotify(ctx context.Context, c Config, id Identity, n int, co 
 		return e
 	}
 	r.closers = append(r.closers, listener.Close)
-	if e = Save(filepath.Join(dir, "config.yml"), SpotifyYAML(id, socket, c.Spotify.Ports[n], c.Volume.Initial)); e != nil {
+	instance := Nonce()
+	admissionSocket := filepath.Join(dir, "admission.sock")
+	admissionListener, e := control.Listen(admissionSocket)
+	if e != nil {
+		return e
+	}
+	r.closers = append(r.closers, admissionListener.Close)
+	admissions := spotify.NewAdmissions(ctx, co, id.Group, instance)
+	r.workers.Go(func() {
+		if admissions.Serve(ctx, admissionListener) != nil && ctx.Err() == nil {
+			r.fail()
+		}
+	})
+	yaml := append(SpotifyYAML(id, socket, c.Spotify.Ports[n], c.Volume.Initial, c.Spotify.ZeroconfPorts[n]), []byte(fmt.Sprintf("framed_instance: %s\nframed_admission_socket: %s\nzeroconf_interfaces_to_advertise: [%s]\n", strconv.Quote(instance), strconv.Quote(admissionSocket), strconv.Quote(c.Interface)))...)
+	if e = Save(filepath.Join(dir, "config.yml"), yaml); e != nil {
 		return e
 	}
 	process, e := source.StartDaemon(ctx, c.Spotify.Helper, []string{"-config_dir", dir})
@@ -160,13 +174,19 @@ func (r *Runtime) spotify(ctx context.Context, c Config, id Identity, n int, co 
 		}
 	}
 	var mu sync.Mutex
-	var current *spotify.Input
 	var lease source.Lease
-	notifications := make(chan string, 16)
+	type observation struct {
+		kind  string
+		lease source.Lease
+	}
+	notifications := make(chan observation, 16)
 	r.workers.Go(func() {
 		api.Watch(ctx, func(kind string) {
+			mu.Lock()
+			event := observation{kind, lease}
+			mu.Unlock()
 			select {
-			case notifications <- kind:
+			case notifications <- event:
 			default:
 			}
 		})
@@ -176,14 +196,14 @@ func (r *Runtime) spotify(ctx context.Context, c Config, id Identity, n int, co 
 			select {
 			case <-ctx.Done():
 				return
-			case kind := <-notifications:
-				mu.Lock()
-				input, l := current, lease
-				mu.Unlock()
-				if kind == "active" && input != nil {
-					input.Activate()
+			case event := <-notifications:
+				l := event.lease
+				if event.kind == "reconcile" || event.kind == "active" || event.kind == "inactive" || event.kind == "stopped" {
+					// Read actual bounded state after reconnect. Observations cannot
+					// grant ownership; callbacks retain their captured generation.
+					api.Reconcile(ctx, co, l)
 				}
-				if (kind == "volume" || kind == "reconcile") && co.Current(l) {
+				if (event.kind == "volume" || event.kind == "reconcile") && co.Current(l) {
 					v, e := api.CurrentVolume(ctx)
 					if e == nil {
 						co.Volume(l, v)
@@ -201,7 +221,7 @@ func (r *Runtime) spotify(ctx context.Context, c Config, id Identity, n int, co 
 				}
 				return
 			}
-			input := &spotify.Input{Group: id.Group, Coordinator: co, TargetDB: target, Release: func() { _ = api.Control(ctx, "stop", 0) }, Lease: func(l source.Lease) {
+			input := &spotify.Input{Group: id.Group, Coordinator: co, TargetDB: target, Admissions: admissions, Lease: func(l source.Lease) {
 				mu.Lock()
 				lease = l
 				mu.Unlock()
@@ -215,12 +235,8 @@ func (r *Runtime) spotify(ctx context.Context, c Config, id Identity, n int, co 
 					co.Mute(l, true)
 				}
 			}}
-			mu.Lock()
-			current = input
-			mu.Unlock()
 			_ = input.Run(ctx, conn)
 			mu.Lock()
-			current = nil
 			lease = source.Lease{}
 			mu.Unlock()
 			if ctx.Err() != nil {
@@ -322,3 +338,5 @@ func (r *Runtime) youtube(ctx context.Context, c Config, ids []Identity, co *sou
 	})
 	return nil
 }
+
+func deploymentDecoderVersion(v string) bool { return v == "9.0.2" || v == "n9.0.2" }

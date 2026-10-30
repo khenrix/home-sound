@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"github.com/khenrix/home-sound/internal/airplay"
 	"github.com/khenrix/home-sound/internal/audio"
 	"github.com/khenrix/home-sound/internal/source"
 	"github.com/khenrix/home-sound/internal/wave"
@@ -57,12 +58,12 @@ func mustJSON(t *testing.T, s string) []byte {
 	return b
 }
 func TestResolverUsesPinnedRestrictedArgvAndPrivateMedia(t *testing.T) {
-	r := fixtureResolver(t, `{"id":"abcdefghijk","availability":"public","title":"Title","duration":60,"acodec":"opus","vcodec":"none","url":"https://rr1.googlevideo.com/videoplayback?expire=9999999999","http_headers":{"User-Agent":"fixture"}}`)
+	r := fixtureResolver(t, `{"id":"abcdefghijk","availability":"public","title":"Title","thumbnail":"https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg?public=1","duration":60,"acodec":"opus","vcodec":"none","url":"https://rr1.googlevideo.com/videoplayback?expire=9999999999","http_headers":{"User-Agent":"fixture"}}`)
 	m, e := r.Resolve(context.Background(), "abcdefghijk")
 	if e != nil {
 		t.Fatalf("resolve public fixture: %v", e)
 	}
-	if m.Metadata.Title != "Title" || m.Duration != time.Minute || m.Expired(time.Now()) {
+	if m.Metadata.ArtworkID != "youtube:video:abcdefghijk" || m.Metadata.ArtworkURL != "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg" || m.Metadata.Title != "Title" || m.Duration != time.Minute || m.Expired(time.Now()) {
 		t.Fatalf("metadata %+v", m.Metadata)
 	}
 	if _, e = r.Resolve(context.Background(), "../../cookie"); e == nil {
@@ -96,11 +97,14 @@ func TestActualFFmpegDecodesBoundedPublicTransportFixture(t *testing.T) {
 	}))
 	defer srv.Close()
 	d := Decoder{Helper: pinnedFile(t, "/usr/bin/ffmpeg"), Version: "8.0.1-3ubuntu2"}
-	p, e := d.Decode(context.Background(), Media{url: srv.URL, Duration: time.Second}, 0)
+	p, e := d.Decode(context.Background(), Media{url: srv.URL, Duration: time.Second, Metadata: airplay.Metadata{ArtworkID: "youtube:video:abcdefghijk", ArtworkURL: "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg"}}, 0)
 	if e != nil {
 		t.Fatalf("decoder: %v", e)
 	}
 	defer p.Close()
+	if p.Metadata().ArtworkID != "youtube:video:abcdefghijk" {
+		t.Fatal("decoder dropped artwork identity")
+	}
 	var frames int
 	for {
 		f, e := p.Read(context.Background())

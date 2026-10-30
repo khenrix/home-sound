@@ -1,18 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Test-only overlay on the pinned corresponding source; never a production daemon.
-package player
+package daemon
 
 import (
+	"context"
+	"encoding/json"
+	librespot "github.com/devgianlu/go-librespot"
+	"github.com/devgianlu/go-librespot/dealer"
 	"github.com/devgianlu/go-librespot/output"
+	"github.com/devgianlu/go-librespot/player"
+	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
 	"io"
+	"net"
 	"os"
 	"testing"
 	"time"
 )
 
 type coreSentinel struct {
-	value float32
-	title string
+	value           float32
+	title           string
+	grant, instance string
 }
 
 func (s *coreSentinel) Read(p []float32) (int, error) {
@@ -24,12 +32,13 @@ func (s *coreSentinel) Read(p []float32) (int, error) {
 func (s *coreSentinel) SetPositionMs(int64) error { s.value = .5; return nil }
 func (*coreSentinel) PositionMs() int64           { return 0 }
 func (s *coreSentinel) FramedIdentity() string {
-	return `{"uri":"spotify:track:fixture","title":"` + s.title + `"}`
+	b, _ := json.Marshal(map[string]string{"uri": "spotify:track:fixture", "title": s.title, "admission": s.grant, "instance": s.instance})
+	return string(b)
 }
 func TestCoreConsumerFixture(t *testing.T) {
-	path := os.Args[len(os.Args)-1]
-	s := NewSwitchingAudioSource(0)
-	s.SetPrimary(&coreSentinel{.25, "first"})
+	path, grant, instance := fixtureAdmission(t)
+	s := player.NewSwitchingAudioSource(0)
+	s.SetPrimary(fixtureSource(&coreSentinel{.25, "first", grant, instance}, "first", grant, instance))
 	out, e := output.NewOutput(&output.NewOutputOptions{Backend: "framed", Reader: s, OutputPipe: path, SampleRate: 44100, ChannelCount: 2, ExternalVolume: true, VolumeUpdate: make(chan float32, 1)})
 	if e != nil {
 		t.Fatal(e)
@@ -53,7 +62,7 @@ func TestCoreConsumerFixture(t *testing.T) {
 	if e = out.Drop(); e != nil {
 		t.Fatal(e)
 	}
-	s.SetPrimary(&coreSentinel{.75, "second"})
+	s.SetPrimary(fixtureSource(&coreSentinel{.75, "second", grant, instance}, "second", grant, instance))
 	if e = out.Resume(); e != nil {
 		t.Fatal(e)
 	}
@@ -80,10 +89,10 @@ func (s *coreFinite) Read(p []float32) (int, error) {
 	return n, nil
 }
 func TestCorePrefetchFixture(t *testing.T) {
-	path := os.Args[len(os.Args)-1]
-	s := NewSwitchingAudioSource(0)
-	s.SetPrimary(&coreFinite{coreSentinel{.25, "first"}, 4411})
-	s.SetSecondary(&coreFinite{coreSentinel{.75, "second"}, 8819})
+	path, grant, instance := fixtureAdmission(t)
+	s := player.NewSwitchingAudioSource(0)
+	s.SetPrimary(fixtureSource(&coreFinite{coreSentinel{.25, "first", grant, instance}, 4411}, "first", grant, instance))
+	s.SetSecondary(fixtureSource(&coreFinite{coreSentinel{.75, "second", grant, instance}, 8819}, "second", grant, instance))
 	out, e := output.NewOutput(&output.NewOutputOptions{Backend: "framed", Reader: s, OutputPipe: path, SampleRate: 44100, ChannelCount: 2, ExternalVolume: true, VolumeUpdate: make(chan float32, 1)})
 	if e != nil {
 		t.Fatal(e)
@@ -96,9 +105,9 @@ func TestCorePrefetchFixture(t *testing.T) {
 }
 
 func TestCoreSustainedFixture(t *testing.T) {
-	path := os.Args[len(os.Args)-1]
-	s := NewSwitchingAudioSource(0)
-	s.SetPrimary(&coreSentinel{.25, "sustained"})
+	path, grant, instance := fixtureAdmission(t)
+	s := player.NewSwitchingAudioSource(0)
+	s.SetPrimary(&coreSentinel{.25, "sustained", grant, instance})
 	out, e := output.NewOutput(&output.NewOutputOptions{Backend: "framed", Reader: s, OutputPipe: path, SampleRate: 44100, ChannelCount: 2, ExternalVolume: true, VolumeUpdate: make(chan float32, 1)})
 	if e != nil {
 		t.Fatal(e)
@@ -108,4 +117,83 @@ func TestCoreSustainedFixture(t *testing.T) {
 		t.Fatal(e)
 	}
 	time.Sleep(2 * time.Second)
+}
+
+func fixtureAdmission(t *testing.T) (string, string, string) {
+	t.Helper()
+	args := os.Args[len(os.Args)-3:]
+	p := newTestAppPlayer(t)
+	p.ctx = context.Background()
+	p.app.cfg = &Config{AudioBackend: "framed", FramedAdmissionSocket: args[1], FramedInstance: args[2]}
+	req := dealer.RequestPayload{ReceivedRawNS: dealer.FramedRawNow()}
+	req.Command.Endpoint = "transfer"
+	if e := p.handlePlayerCommand(req); e != nil {
+		t.Fatal(e)
+	}
+	return args[0], p.framedGrant, args[2]
+}
+
+func fixtureSource(src librespot.AudioSource, title, grant, instance string) librespot.AudioSource {
+	track := &metadatapb.Track{Name: &title}
+	if title == "first" {
+		track.Album = &metadatapb.Album{Cover: []*metadatapb.Image{{FileId: make([]byte, 20)}}}
+	}
+	stream := &player.Stream{Source: src, RequestedId: librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeTrack, make([]byte, 16)), Media: librespot.NewMediaFromTrack(track), FramedGrant: grant, FramedInstance: instance}
+	return stream.FramedSource(src)
+}
+
+func TestCoreNativeRecastFixture(t *testing.T) {
+	args := os.Args[len(os.Args)-4:]
+	p := newTestAppPlayer(t)
+	p.ctx = context.Background()
+	p.app.cfg = &Config{AudioBackend: "framed", FramedAdmissionSocket: args[1], FramedInstance: args[2]}
+	req := dealer.RequestPayload{ReceivedRawNS: dealer.FramedRawNow()}
+	req.Command.Endpoint = "transfer"
+	if e := p.handlePlayerCommand(req); e != nil {
+		t.Fatal(e)
+	}
+	old := dealer.RequestPayload{ReceivedRawNS: dealer.FramedRawNow()}
+	old.Command.Endpoint = "transfer"
+	control, e := net.Dial("unix", args[3])
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer control.Close()
+	control.SetDeadline(time.Now().Add(4 * time.Second))
+	start := func(title string) output.Output {
+		s := player.NewSwitchingAudioSource(0)
+		s.SetPrimary(fixtureSource(&coreSentinel{.25, title, p.framedGrant, args[2]}, title, p.framedGrant, args[2]))
+		out, e := output.NewOutput(&output.NewOutputOptions{Backend: "framed", Reader: s, OutputPipe: args[0], SampleRate: 44100, ChannelCount: 2, ExternalVolume: true, VolumeUpdate: make(chan float32, 1)})
+		if e != nil {
+			t.Fatal(e)
+		}
+		if e = out.Resume(); e != nil {
+			t.Fatal(e)
+		}
+		return out
+	}
+	first := start("first")
+	defer first.Close()
+	var signal [1]byte
+	if _, e = io.ReadFull(control, signal[:]); e != nil {
+		t.Fatal(e)
+	}
+	if e = p.handlePlayerCommand(old); e == nil {
+		t.Fatal("queued native handler re-acquired revoked source")
+	}
+	if _, e = control.Write([]byte{'R'}); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = io.ReadFull(control, signal[:]); e != nil {
+		t.Fatal(e)
+	}
+	req.ReceivedRawNS = dealer.FramedRawNow()
+	if e = p.handlePlayerCommand(req); e != nil {
+		t.Fatal(e)
+	}
+	second := start("second")
+	defer second.Close()
+	if _, e = io.ReadFull(control, signal[:]); e != nil {
+		t.Fatal(e)
+	}
 }

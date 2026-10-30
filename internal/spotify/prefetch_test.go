@@ -27,7 +27,8 @@ type continuityOutput struct {
 	prepared    <-chan struct{}
 	data        []float32
 	metadata    []airplay.Metadata
-	metadataAt  []time.Time
+	metadataAt  []time.Duration
+	clock       session.Clock
 	status      airplay.Status
 	bad         error
 }
@@ -77,7 +78,7 @@ func (o *continuityOutput) Metadata(_ context.Context, m airplay.Metadata) error
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.metadata = append(o.metadata, m)
-	o.metadataAt = append(o.metadataAt, time.Now())
+	o.metadataAt = append(o.metadataAt, o.clock.Now())
 	return nil
 }
 func continuityConfig() config.Config {
@@ -115,16 +116,6 @@ func TestActualPrefetchKeepsEngineOutputsAndConverter(t *testing.T) {
 	defer l.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	proc, e := source.StartProcess(ctx, source.Helper{Path: path, SHA256: hex.EncodeToString(sum[:])}, []string{"-test.run=^TestCorePrefetchFixture$", socket}, 5*time.Second)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer proc.Close()
-	l.(*net.UnixListener).SetDeadline(time.Now().Add(2 * time.Second))
-	conn, e := l.Accept()
-	if e != nil {
-		t.Fatal(e)
-	}
 	clock, e := session.NewRawClock()
 	if e != nil {
 		t.Fatal(e)
@@ -135,7 +126,7 @@ func TestActualPrefetchKeepsEngineOutputsAndConverter(t *testing.T) {
 	prepared := make(chan struct{})
 	made := 0
 	engine, e := session.New(continuityConfig(), clock, mapping.OffsetNS, func(_ context.Context, r session.DeviceRequest) (session.Output, error) {
-		o := &continuityOutput{prepared: prepared}
+		o := &continuityOutput{prepared: prepared, clock: clock}
 		mu.Lock()
 		outputs[r.ID] = append(outputs[r.ID], o)
 		made++
@@ -150,8 +141,19 @@ func TestActualPrefetchKeepsEngineOutputsAndConverter(t *testing.T) {
 	}
 	defer engine.Stop()
 	co := source.NewCoordinator(engine, nil)
+	admissions, admissionSocket := testAdmissionServer(t, ctx, co)
+	proc, e := source.StartProcess(ctx, source.Helper{Path: path, SHA256: hex.EncodeToString(sum[:])}, []string{"-test.run=^TestCorePrefetchFixture$", socket, admissionSocket, testInstance}, 5*time.Second)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer proc.Close()
+	l.(*net.UnixListener).SetDeadline(time.Now().Add(2 * time.Second))
+	conn, e := l.Accept()
+	if e != nil {
+		t.Fatal(e)
+	}
 	var leases []source.Lease
-	_ = (&Input{Group: config.AllSpeakers, Coordinator: co, TargetDB: -30, Lease: func(l source.Lease) { leases = append(leases, l) }}).Run(ctx, conn)
+	_ = (&Input{Group: config.AllSpeakers, Coordinator: co, Admissions: admissions, TargetDB: -30, Lease: func(l source.Lease) { leases = append(leases, l) }}).Run(ctx, conn)
 
 	if len(leases) != 2 || leases[0].Epoch != leases[1].Epoch {
 		t.Fatalf("natural promotion replaced session epoch: %+v", leases)
@@ -186,8 +188,8 @@ func TestActualPrefetchKeepsEngineOutputsAndConverter(t *testing.T) {
 		found := false
 		for index, m := range o.metadata {
 			if m.Title == "second" {
-				if o.metadataAt[index].Before(o.status.Anchor.At.Add(time.Duration(4802)*time.Second/48000 - time.Millisecond)) {
-					t.Fatal("actual prefetch metadata preceded content boundary")
+				if o.metadataAt[index] < time.Duration(o.status.Anchor.At.UnixNano()-mapping.OffsetNS)+time.Duration(4802-o.status.Anchor.Sample)*time.Second/48000-time.Millisecond {
+					t.Fatalf("actual prefetch metadata preceded content boundary: at=%v anchor=%v sample=%d delay=%v", o.metadataAt[index], o.status.Anchor.At, o.status.Anchor.Sample, o.metadataAt[index]-time.Duration(o.status.Anchor.At.UnixNano()-mapping.OffsetNS))
 				}
 				found = true
 			}

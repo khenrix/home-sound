@@ -60,7 +60,7 @@ type Status struct {
 	Transport                             Transport
 	RouteVerified, CapabilitiesVerified   bool
 }
-type Metadata struct{ Title, Artist, Album string }
+type Metadata struct{ Title, Artist, Album, ArtworkID, ArtworkURL string }
 type Output interface {
 	Prepare(context.Context, uint64, uint64) error
 	Write(context.Context, audio.Frame) error
@@ -518,6 +518,10 @@ func (a *Adapter) Start(ctx context.Context, epoch uint64, at time.Time) (Anchor
 	return a.Status().Anchor, nil
 }
 func (a *Adapter) Metadata(ctx context.Context, m Metadata) error {
+	if e := m.Validate(); e != nil {
+		return e
+	}
+	// Artwork identity reaches this boundary; native image-byte transmission is Task 6.
 	for _, v := range []string{m.Title, m.Artist, m.Album} {
 		if len(v) > 1024 || strings.ContainsAny(v, "\r\n\x00") {
 			return errors.New("invalid metadata")

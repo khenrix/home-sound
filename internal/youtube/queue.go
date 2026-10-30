@@ -233,3 +233,22 @@ func (q *Queue) initialVolume(v int) {
 		q.p.Volume = v
 	}
 }
+
+func (q *Queue) PresentedGeneration(g uint64, position time.Duration, ended, paused, buffering bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.generation != g {
+		return
+	}
+	q.p.Position = position
+	switch {
+	case ended:
+		q.p.State = 4
+	case paused:
+		q.p.State = 2
+	case buffering:
+		q.p.State = 3
+	default:
+		q.p.State = 1
+	}
+}

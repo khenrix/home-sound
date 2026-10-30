@@ -132,11 +132,19 @@ func (r Resolver) Resolve(ctx context.Context, id string) (Media, error) {
 			return Media{}, ErrUnsupported
 		}
 	}
-	artwork := ""
-	if a, e := url.Parse(m.Thumbnail); e == nil && a.Scheme == "https" && a.Hostname() == "i.ytimg.com" && len(m.Thumbnail) <= 2048 {
-		artwork = m.Thumbnail
+
+	metadata := airplay.Metadata{Title: display(m.Title), Artist: display(m.Uploader)}
+	if a, e := url.Parse(m.Thumbnail); e == nil && a.User == nil {
+		a.RawQuery = ""
+		a.Fragment = ""
+		candidate := metadata
+		candidate.ArtworkID = "youtube:video:" + id
+		candidate.ArtworkURL = a.String()
+		if candidate.Validate() == nil {
+			metadata = candidate
+		}
 	}
-	return Media{url: m.URL, headers: headers, Metadata: airplay.Metadata{Title: display(m.Title), Artist: display(m.Uploader)}, Duration: time.Duration(m.Duration * float64(time.Second)), Artwork: artwork}, nil
+	return Media{url: m.URL, headers: headers, Metadata: metadata, Duration: time.Duration(m.Duration * float64(time.Second)), Artwork: metadata.ArtworkURL}, nil
 }
 
 type Decoder struct {

@@ -27,9 +27,10 @@ type Config struct {
 	Volume    VolumeConfig  `json:"volume"`
 }
 type SpotifyConfig struct {
-	Enabled bool          `json:"enabled"`
-	Helper  source.Helper `json:"helper"`
-	Ports   [2]int        `json:"ports"`
+	ZeroconfPorts [2]int        `json:"zeroconf_ports"`
+	Enabled       bool          `json:"enabled"`
+	Helper        source.Helper `json:"helper"`
+	Ports         [2]int        `json:"ports"`
 }
 type YouTubeConfig struct {
 	Enabled        bool          `json:"enabled"`
@@ -70,7 +71,7 @@ func (c Config) Validate() error {
 	for _, p := range []struct {
 		enabled bool
 		ports   [2]int
-	}{{c.Spotify.Enabled, c.Spotify.Ports}, {c.YouTube.Enabled, c.YouTube.Ports}} {
+	}{{c.Spotify.Enabled, c.Spotify.Ports}, {c.Spotify.Enabled, c.Spotify.ZeroconfPorts}, {c.YouTube.Enabled, c.YouTube.Ports}} {
 		if p.enabled {
 			for _, n := range p.ports {
 				if n < 1024 || n > 65535 || ports[n] {
@@ -79,6 +80,9 @@ func (c Config) Validate() error {
 				ports[n] = true
 			}
 		}
+	}
+	if c.Spotify.Enabled && c.Interface == "" {
+		return errors.New("explicit Spotify advertisement interface required")
 	}
 	if c.YouTube.Enabled {
 		ip := net.ParseIP(c.BindIP)

@@ -9,7 +9,6 @@ import (
 	"github.com/khenrix/home-sound/internal/resample"
 	"io"
 	"math"
-	"strings"
 	"sync"
 )
 
@@ -33,10 +32,8 @@ func NewPCM(r PCMReader, rate int, m airplay.Metadata) (*PCM, error) {
 	if r == nil || rate != 44100 && rate != 48000 {
 		return nil, errors.New("invalid PCM source format")
 	}
-	for _, s := range []string{m.Title, m.Artist, m.Album} {
-		if len(s) > 1024 || strings.ContainsAny(s, "\r\n\x00") {
-			return nil, errors.New("invalid source metadata")
-		}
+	if e := m.Validate(); e != nil {
+		return nil, e
 	}
 	p := &PCM{reader: r, rate: rate, metadata: m}
 	if rate == 44100 {

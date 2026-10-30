@@ -177,6 +177,9 @@ func (e *Engine) Select(sel Selection) (uint64, error) {
 		}
 		reserve = time.Duration(n) * time.Second / 48000
 	}
+	if e := sel.Source.Metadata().Validate(); e != nil {
+		return 0, e
+	}
 	ids, ok := e.cfg.Groups[sel.Group]
 	if !ok {
 		return 0, errors.New("unknown destination")

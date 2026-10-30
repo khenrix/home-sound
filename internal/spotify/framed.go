@@ -15,7 +15,6 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -24,18 +23,19 @@ type Input struct {
 	Group       string
 	Coordinator *source.Coordinator
 	TargetDB    float64
-	Release     func()
 	Lease       func(source.Lease)
-	admitted    atomic.Bool
+	Admissions  *Admissions
 }
 
-func (i *Input) Activate() { i.admitted.Store(true) }
-
 type identity struct {
-	URI    string `json:"uri"`
-	Title  string `json:"title"`
-	Artist string `json:"artist"`
-	Album  string `json:"album"`
+	Admission  string `json:"admission"`
+	Instance   string `json:"instance"`
+	URI        string `json:"uri"`
+	ArtworkID  string `json:"artwork_id"`
+	ArtworkURL string `json:"artwork_url"`
+	Title      string `json:"title"`
+	Artist     string `json:"artist"`
+	Album      string `json:"album"`
 }
 type record struct {
 	Version             int
@@ -81,7 +81,7 @@ func readRecord(c net.Conn) (record, error) {
 		return r, errors.New("invalid framed field")
 	}
 	_, e := hex.DecodeString(r.Nonce)
-	if r.Version != 1 || len(r.Nonce) != 32 || r.Nonce != strings.ToLower(r.Nonce) || e != nil || r.Rate != 44100 || r.Channels != 2 || len(r.PCM) > 7056 || len(r.PCM)%8 != 0 {
+	if r.Version != 2 || len(r.Nonce) != 32 || r.Nonce != strings.ToLower(r.Nonce) || e != nil || r.Rate != 44100 || r.Channels != 2 || len(r.PCM) > 7056 || len(r.PCM)%8 != 0 {
 		return r, errors.New("invalid framed format")
 	}
 	if r.Transport != "playing" && r.Transport != "paused" || r.Terminal != "" && r.Terminal != "track_end" && r.Terminal != "error" {
@@ -101,16 +101,25 @@ func readRecord(c net.Conn) (record, error) {
 			return r, errors.New("nonfinite framed PCM")
 		}
 	}
+	if (airplay.Metadata{Title: r.Identity.Title, Artist: r.Identity.Artist, Album: r.Identity.Album, ArtworkID: r.Identity.ArtworkID, ArtworkURL: r.Identity.ArtworkURL}).Validate() != nil {
+		return r, errors.New("invalid artwork metadata")
+	}
 	return r, nil
 }
 func (i *Input) Run(ctx context.Context, c net.Conn) error {
 	defer c.Close()
 	stop := context.AfterFunc(ctx, func() { c.Close() })
 	defer stop()
-	if i.Coordinator == nil {
+	if i.Coordinator == nil || i.Admissions == nil {
 		return errors.New("input coordinator required")
 	}
-	i.admitted.Store(true)
+	var admission *grant
+	var stopGrant func() bool
+	defer func() {
+		if stopGrant != nil {
+			stopGrant()
+		}
+	}()
 	var nonce string
 	var gen, next, total uint64
 	var meta identity
@@ -126,13 +135,13 @@ func (i *Input) Run(ctx context.Context, c net.Conn) error {
 		i.Coordinator.End(lease)
 	}()
 	for {
-		if pipe != nil && i.admitted.Load() && state == "playing" && !trackEnded && !pipe.capacity() {
+		if pipe != nil && (admission != nil && admission.ctx.Err() == nil) && state == "playing" && !trackEnded && !pipe.capacity() {
 			if e := pipe.waitSpace(ctx); e != nil {
 				return e
 			}
 		}
 		credit := byte(2)
-		if pipe == nil || i.admitted.Load() && state == "playing" && pipe.capacity() {
+		if pipe == nil || (admission != nil && admission.ctx.Err() == nil) && state == "playing" && pipe.capacity() {
 			credit = 1
 		}
 		c.SetDeadline(time.Now().Add(2 * time.Second))
@@ -145,9 +154,6 @@ func (i *Input) Run(ctx context.Context, c net.Conn) error {
 		}
 		if nonce == "" {
 			nonce = r.Nonce
-			if e = i.Coordinator.Register(source.Identity{Provider: "spotify", Group: i.Group, Instance: nonce, Generation: 1}); e != nil {
-				return e
-			}
 		}
 		if nonce != r.Nonce || r.Generation < gen {
 			return errors.New("stale framed instance or generation")
@@ -157,46 +163,61 @@ func (i *Input) Run(ctx context.Context, c net.Conn) error {
 				return errors.New("PCM without source")
 			}
 		} else {
+			if admission == nil {
+				admission, lease, e = i.Admissions.bind(r.Identity.Admission, r.Identity.Instance, nonce, r.Generation)
+				if e != nil {
+					return e
+				}
+				stopGrant = context.AfterFunc(admission.ctx, func() { c.Close() })
+			}
+			if r.Identity.Admission != admission.token || r.Identity.Instance != i.Admissions.instance || admission.ctx.Err() != nil {
+				return errors.New("revoked framed admission")
+			}
 			if r.Generation != gen {
 				if r.Offset != 0 {
 					return errors.New("new source offset is not zero")
 				}
 
-				natural := gen != 0 && r.Reason == "prefetch" && pipe != nil && i.admitted.Load()
+				first := gen == 0
+				natural := gen != 0 && r.Reason == "prefetch" && pipe != nil && (admission != nil && admission.ctx.Err() == nil)
 				trackEnded = false
 				gen = r.Generation
 				next = 0
 				meta = r.Identity
 				reason = r.Reason
-				metadata := airplay.Metadata{Title: meta.Title, Artist: meta.Artist, Album: meta.Album}
+				metadata := airplay.Metadata{Title: meta.Title, Artist: meta.Artist, Album: meta.Album, ArtworkID: meta.ArtworkID, ArtworkURL: meta.ArtworkURL}
 				if natural {
-					lease, e = i.Coordinator.Advance(lease, gen, (total*160+146)/147, metadata)
-					if e != nil {
-						return e
+					nextLease, advanceErr := i.Admissions.transition(admission, lease, func() (source.Lease, error) { return i.Coordinator.Advance(lease, gen, (total*160+146)/147, metadata) })
+					if advanceErr != nil {
+						return advanceErr
 					}
+					lease = nextLease
 				} else {
 					total = 0
 					if pipe != nil {
 						pipe.Close()
 					}
 					pipe = newPacketReader()
-					if i.admitted.Load() {
+					if admission != nil && admission.ctx.Err() == nil {
 						pcm, e := source.NewPCM(pipe, 44100, metadata)
 						if e != nil {
 							return e
 						}
-						lease, e = i.Coordinator.Select(source.Identity{Provider: "spotify", Group: i.Group, Instance: nonce, Generation: gen}, pcm, r.Transport == "paused", i.TargetDB, func() {
-							i.admitted.Store(false)
-							if i.Release != nil {
-								i.Release()
+						old := lease
+						nextLease, transitionErr := i.Admissions.transition(admission, old, func() (source.Lease, error) {
+							if first {
+								return old, i.Coordinator.Commit(old, pcm, r.Transport == "paused", i.TargetDB, admission.cancel)
 							}
+							return i.Coordinator.Replace(old, gen, pcm, r.Transport == "paused", i.TargetDB, admission.cancel)
 						})
-						if e != nil {
-							return e
+						if transitionErr != nil {
+							pcm.Close()
+							return transitionErr
 						}
+						lease = nextLease
 					}
 				}
-				if i.admitted.Load() && i.Lease != nil {
+				if (admission != nil && admission.ctx.Err() == nil) && i.Lease != nil {
 					i.Lease(lease)
 				}
 
@@ -210,7 +231,7 @@ func (i *Input) Run(ctx context.Context, c net.Conn) error {
 				}
 				next += uint64(len(r.PCM) / 8)
 				total += uint64(len(r.PCM) / 8)
-				if i.admitted.Load() {
+				if admission != nil && admission.ctx.Err() == nil {
 					if !pipe.offer(r.PCM) {
 						return errors.New("framed PCM overflow")
 					}
@@ -228,7 +249,7 @@ func (i *Input) Run(ctx context.Context, c net.Conn) error {
 			}
 		}
 		state = r.Transport
-		if credit == 2 && pipe != nil && i.admitted.Load() && state == "playing" && !trackEnded {
+		if credit == 2 && pipe != nil && (admission != nil && admission.ctx.Err() == nil) && state == "playing" && !trackEnded {
 			if !pipe.capacity() {
 				if e := pipe.waitSpace(ctx); e != nil {
 					return e

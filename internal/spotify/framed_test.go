@@ -12,12 +12,12 @@ import (
 	"time"
 )
 
-func wire(c net.Conn, g uint64, off uint64, pcm []byte, transport string) error {
+func wire(c net.Conn, g uint64, off uint64, pcm []byte, transport string, token string) error {
 	var credit [1]byte
 	if _, e := io.ReadFull(c, credit[:]); e != nil {
 		return e
 	}
-	b, _ := json.Marshal(map[string]any{"Version": 1, "Nonce": "11111111111111111111111111111111", "Generation": g, "Offset": off, "Identity": map[string]string{"uri": "spotify:track:fixture", "title": "track", "artist": "artist", "album": "album"}, "Reason": "source", "Rate": 44100, "Channels": 2, "PCM": pcm, "Terminal": "", "Transport": transport})
+	b, _ := json.Marshal(map[string]any{"Version": 2, "Nonce": "11111111111111111111111111111111", "Generation": g, "Offset": off, "Identity": map[string]string{"admission": token, "instance": testInstance, "uri": "spotify:track:fixture", "title": "track", "artist": "artist", "album": "album"}, "Reason": "source", "Rate": 44100, "Channels": 2, "PCM": pcm, "Terminal": "", "Transport": transport})
 	var h [4]byte
 	binary.BigEndian.PutUint32(h[:], uint32(len(b)))
 	if _, e := c.Write(h[:]); e != nil {
@@ -30,6 +30,7 @@ func TestFramedGenerationPauseAndReconnectFence(t *testing.T) {
 	o := source.NewObserver()
 	defer o.Stop()
 	co := source.NewCoordinator(o, nil)
+	admissions, token := testAdmission(t, co)
 	a, b := net.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -37,7 +38,7 @@ func TestFramedGenerationPauseAndReconnectFence(t *testing.T) {
 	leases := make(chan source.Lease, 4)
 	done := make(chan error, 1)
 	go func() {
-		done <- (&Input{Group: config.AllSpeakers, Coordinator: co, Lease: func(l source.Lease) { leases <- l }}).Run(ctx, a)
+		done <- (&Input{Group: config.AllSpeakers, Coordinator: co, Admissions: admissions, Lease: func(l source.Lease) { leases <- l }}).Run(ctx, a)
 	}()
 	sent := make(chan error, 1)
 	go func() {
@@ -45,11 +46,11 @@ func TestFramedGenerationPauseAndReconnectFence(t *testing.T) {
 		for i := 0; i < len(pcm); i += 4 {
 			binary.LittleEndian.PutUint32(pcm[i:], 0x3e800000)
 		}
-		if e := wire(b, 1, 0, pcm, "playing"); e != nil {
+		if e := wire(b, 1, 0, pcm, "playing", token); e != nil {
 			sent <- e
 			return
 		}
-		sent <- wire(b, 2, 0, nil, "paused")
+		sent <- wire(b, 2, 0, nil, "paused", token)
 	}()
 	select {
 	case e := <-done:

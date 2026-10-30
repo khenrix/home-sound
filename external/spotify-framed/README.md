@@ -10,7 +10,11 @@ remains pinned to the release. `SHA256SUMS` identifies this patch and GPL text.
 The stock pipe backend is unchanged. Select `audio_backend: framed`,
 `audio_output_pipe: /absolute/private/pcm.sock`, `external_volume: true`,
 `crossfade_duration: 0`, and `normalisation_disabled: true`. The operator must
-prepare a protected Unix listener before allowing playback. All identity,
+prepare protected PCM and admission Unix listeners before allowing playback.
+Set `framed_instance` to the supervisor-generated process nonce and
+`framed_admission_socket` to its private Unix socket; neither is an account
+credential. `zeroconf_port` and `zeroconf_interfaces_to_advertise` set the
+explicit operator-approved native discovery listener/interface. All identity,
 REST and credential directories remain separate per configured destination.
 Starting the helper advertises Connect; neither this build nor tests start a
 real daemon or authenticate. Narrated/DJ sources fail closed; ordinary tracks
@@ -42,7 +46,19 @@ actual build information must accompany deployment. No binary is committed. `bui
 source pin, toolchain, native dependency manifest and independently reproduced
 binary hashes; it is software build evidence, not live acceptance.
 
-## Protocol version 1
+## Protocol version 2
+
+A native play/transfer command requests admission before asynchronous loading.
+The Dealer stamps the command with Linux `CLOCK_MONOTONIC_RAW` before queuing;
+the helper supplies that receive marker, a process-wide increasing sequence and
+its configured instance. The local core rejects commands received before a later
+handoff, then grants an opaque token. IPC is capped at 500 ms and bounded JSON.
+Already-current retaining transfers keep their grant; a genuine fresh recast
+replaces a revoked grant. Seeks and prefetched streams retain immutable grants.
+Grant revocation cancels the old PCM connection. Reconnect requires a fresh
+native grant and new output nonce. Tokens are never persisted or logged.
+WebSocket/REST active notifications cannot mint grants. The core and framed
+helper must share the same Linux host clock; unsupported hosts fail closed.
 
 The helper connects to the configured private Unix stream. Each output
 instance generates a fresh 128-bit lowercase hexadecimal `Nonce`. A stopped
@@ -58,11 +74,14 @@ source under its lock. Stock WebSocket metadata is never an audio boundary.
 Responses are a four-byte unsigned big-endian length (1–32768), followed by
 one UTF-8 JSON object. Field names are case-sensitive:
 
-- `Version`: 1; `Nonce`: 32 hexadecimal characters.
+- `Version`: 2; `Nonce`: 32 hexadecimal characters.
 - `Generation`: monotonic source generation, changed by a genuinely new
   source, successful seek, and automatic prefetch promotion.
 - `Offset`: relative decoded stereo frame offset in that generation.
-- `Identity`: object with bounded `uri`, `title`, optional `artist`, `album`.
+- `Identity`: bounded `uri`, `title`, optional `artist`, `album`, `artwork_id`,
+  `artwork_url`, plus private `instance` and `admission` authority. Artwork uses
+  `spotify:image:<40 lowercase hex>` and its matching `https://i.scdn.co/image/`
+  URL. Missing artwork clears the previous identity at the content boundary.
 - `Reason`: `source`, `seek`, or `prefetch`; repeated for the generation.
 - `Rate`: 44100; `Channels`: 2.
 - `PCM`: base64 of interleaved little-endian IEEE float32 bytes; finite only,

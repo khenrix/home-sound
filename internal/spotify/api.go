@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/coder/websocket"
+	"github.com/khenrix/home-sound/internal/source"
 	"io"
 	"net"
 	"net/http"
@@ -133,4 +134,26 @@ func (a *API) Watch(ctx context.Context, notify func(string)) {
 		case <-timer.C:
 		}
 	}
+}
+
+type PlaybackStatus struct {
+	Stopped bool `json:"stopped"`
+	Paused  bool `json:"paused"`
+}
+
+func (a *API) Status(ctx context.Context) (PlaybackStatus, error) {
+	b, e := a.request(ctx, "GET", "/status", nil)
+	var v PlaybackStatus
+	if e != nil || json.Unmarshal(b, &v) != nil {
+		return v, errors.New("helper status unavailable")
+	}
+	return v, nil
+}
+
+// Reconcile reads actual state against the lease captured at event receipt.
+// Framed transport remains authoritative: a REST paused/stopped observation
+// cannot truncate a terminal PCM tail that is still being presented.
+func (a *API) Reconcile(ctx context.Context, co *source.Coordinator, l source.Lease) (PlaybackStatus, bool) {
+	state, e := a.Status(ctx)
+	return state, e == nil && co.Current(l)
 }

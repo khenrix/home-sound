@@ -1,8 +1,117 @@
+diff --git a/cmd/daemon/cli_config.go b/cmd/daemon/cli_config.go
+index ae7dc94..75a4a46 100644
+--- a/cmd/daemon/cli_config.go
++++ b/cmd/daemon/cli_config.go
+@@ -37,6 +37,8 @@ type cliConfig struct {
+ 	DeviceType  string `koanf:"device_type"`
+ 	ClientToken string `koanf:"client_token"`
+ 
++	FramedInstance               string `koanf:"framed_instance"`
++	FramedAdmissionSocket        string `koanf:"framed_admission_socket"`
+ 	AudioBackend                 string `koanf:"audio_backend"`
+ 	AudioBackendRuntimeSocket    string `koanf:"audio_backend_runtime_socket"`
+ 	AudioDevice                  string `koanf:"audio_device"`
+@@ -107,6 +109,7 @@ type cliConfig struct {
+ 
+ func (c *cliConfig) toDaemonConfig() *daemon.Config {
+ 	dc := &daemon.Config{
++		FramedInstance: c.FramedInstance, FramedAdmissionSocket: c.FramedAdmissionSocket,
+ 		DeviceId:    c.DeviceId,
+ 		DeviceName:  c.DeviceName,
+ 		DeviceType:  c.DeviceType,
+diff --git a/cmd/daemon/cli_config_test.go b/cmd/daemon/cli_config_test.go
+index 18f6676..9b56f81 100644
+--- a/cmd/daemon/cli_config_test.go
++++ b/cmd/daemon/cli_config_test.go
+@@ -120,3 +120,19 @@ func TestLoadCLIConfigWaitForReaderFlag(t *testing.T) {
+ 	})
+ 	require.True(t, cfg.AudioOutputPipeWaitForReader, "audio_output_pipe_wait_for_reader was not parsed from the config file")
+ }
++
++func TestFramedAdmissionConfigReachesDaemon(t *testing.T) {
++	dir := t.TempDir()
++	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yml"), []byte("audio_backend: framed\nframed_instance: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nframed_admission_socket: /private/admission.sock\nzeroconf_port: 38421\nzeroconf_interfaces_to_advertise: [lo]\nserver:\n  enabled: true\n  address: 127.0.0.1\n  port: 38401\n"), 0600))
++	old := os.Args
++	defer func() { os.Args = old }()
++	os.Args = []string{"test", "--config_dir", dir}
++	cfg := new(cliConfig)
++	require.NoError(t, loadCLIConfig(cfg))
++	defer cfg.configLock.Unlock()
++	dc := cfg.toDaemonConfig()
++	require.Equal(t, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", dc.FramedInstance, "generated native admission instance was dropped by CLI loader")
++	require.Equal(t, "/private/admission.sock", dc.FramedAdmissionSocket)
++	require.Equal(t, 38421, dc.ZeroconfPort)
++	require.Equal(t, []string{"lo"}, dc.ZeroconfInterfacesToAdvertise)
++}
+diff --git a/daemon/app.go b/daemon/app.go
+index 6376f59..27a96fa 100644
+--- a/daemon/app.go
++++ b/daemon/app.go
+@@ -9,6 +9,7 @@ import (
+ 	"net/http"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
+@@ -24,8 +25,9 @@ import (
+ )
+ 
+ type App struct {
+-	log librespot.Logger
+-	cfg *Config
++	framedSequence atomic.Uint64
++	log            librespot.Logger
++	cfg            *Config
+ 
+ 	stateStore librespot.StateStore
+ 
+diff --git a/daemon/config.go b/daemon/config.go
+index 5a10b3f..65e27d3 100644
+--- a/daemon/config.go
++++ b/daemon/config.go
+@@ -4,10 +4,12 @@ import "time"
+ 
+ // Config carries the runtime configuration for a daemon instance.
+ type Config struct {
+-	DeviceId    string
+-	DeviceName  string
+-	DeviceType  string
+-	ClientToken string
++	FramedInstance        string
++	FramedAdmissionSocket string
++	DeviceId              string
++	DeviceName            string
++	DeviceType            string
++	ClientToken           string
+ 
+ 	AudioBackend                 string
+ 	AudioBackendRuntimeSocket    string
 diff --git a/daemon/controls.go b/daemon/controls.go
-index cfe8540..63c15e1 100644
+index cfe8540..5ad06fc 100644
 --- a/daemon/controls.go
 +++ b/daemon/controls.go
-@@ -127,6 +127,9 @@ func closeSource(source librespot.AudioSource) {
+@@ -85,6 +85,10 @@ func (p *AppPlayer) submitPrefetch(uri string, metadata map[string]string) {
+ 
+ 	p.app.log.WithField("uri", nextId.Uri()).Debugf("prefetching next %s", nextId.Type())
+ 
++	grant, instance := p.framedGrant, ""
++	if p.app.cfg != nil {
++		instance = p.app.cfg.FramedInstance
++	}
+ 	p.loader.submit(loaderJob{
+ 		name:  "prefetch " + nextId.Uri(),
+ 		class: classPrefetch,
+@@ -95,6 +99,7 @@ func (p *AppPlayer) submitPrefetch(uri string, metadata map[string]string) {
+ 				return loaderResult{err: fmt.Errorf("failed prefetching %s stream: %w", nextId.Type(), err)}
+ 			}
+ 
++			stream.FramedGrant, stream.FramedInstance = grant, instance
+ 			// Narration is prefetched with the track. The player promotes this
+ 			// source the instant the current one ends, so if it were the bare
+ 			// track the music would be heard for however long the synthesis
+@@ -127,6 +132,9 @@ func closeSource(source librespot.AudioSource) {
  }
  
  func (p *AppPlayer) commitPrefetch(stream *player.Stream, source librespot.AudioSource) {
@@ -12,7 +121,34 @@ index cfe8540..63c15e1 100644
  	p.secondaryStream = stream
  	p.secondarySource = source
  	p.player.SetSecondaryStream(source)
-@@ -941,6 +944,9 @@ type fetchTrackOpts struct {
+@@ -856,6 +864,10 @@ func (p *AppPlayer) loadCurrentTrack(paused, drop, resume bool, delay time.Durat
+ 	}
+ 	p.narrationJumped = false
+ 
++	grant, instance := p.framedGrant, ""
++	if p.app.cfg != nil {
++		instance = p.app.cfg.FramedInstance
++	}
+ 	metadata := maps.Clone(p.state.player.Track.GetMetadata())
+ 	p.loadInFlight = true
+ 
+@@ -879,6 +891,7 @@ func (p *AppPlayer) loadCurrentTrack(paused, drop, resume bool, delay time.Durat
+ 			}
+ 
+ 			stream, streamGen, err := p.fetchTrack(ctx, *spotId, fetchTrackOpts{
++				grant: grant, instance: instance,
+ 				position:         position,
+ 				fromStart:        startsAtZero,
+ 				paused:           paused,
+@@ -925,6 +938,7 @@ func (p *AppPlayer) loadCurrentTrack(paused, drop, resume bool, delay time.Durat
+ }
+ 
+ type fetchTrackOpts struct {
++	grant, instance  string
+ 	position         int64
+ 	fromStart        bool
+ 	paused           bool
+@@ -941,6 +955,9 @@ type fetchTrackOpts struct {
  // for what it handed over, so that the ones held for the outgoing stream can be
  // told apart from them.
  func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId, opts fetchTrackOpts) (*player.Stream, uint64, error) {
@@ -22,16 +158,19 @@ index cfe8540..63c15e1 100644
  	log := p.app.log.WithField("uri", spotId.Uri())
  
  	stream := opts.prefetchedStream
-@@ -949,7 +955,7 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
+@@ -949,7 +966,10 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
  		if stream, err = p.player.NewStream(ctx, p.app.client, spotId, p.app.cfg.Bitrate, opts.position); err != nil {
  			return nil, 0, fmt.Errorf("failed creating stream for %s: %w", spotId, err)
  		}
 -	} else if !opts.fromStart {
++		stream.FramedGrant, stream.FramedInstance = opts.grant, opts.instance
++	} else if opts.grant != "" && (stream.FramedGrant != opts.grant || stream.FramedInstance != opts.instance) {
++		return nil, 0, fmt.Errorf("revoked prefetched admission")
 +	} else if !opts.fromStart && (p.app.cfg == nil || p.app.cfg.AudioBackend != "framed") {
  		// A prefetched stream was created at position zero, so a non-zero start
  		// position (an episode's resume point, or a transfer) has to be applied
  		// here unless the stream is declared to start from zero: seeking a few
-@@ -987,9 +993,10 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
+@@ -987,9 +1007,10 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
  		source = p.narrate(ctx, opts.metadata, spotId.Uri(), source, opts.introPrefix)
  	}
  
@@ -43,7 +182,7 @@ index cfe8540..63c15e1 100644
  	streamGen := p.player.StreamGen()
  
  	p.sess.Events().PostPrimaryStreamLoad(stream, opts.paused)
-@@ -997,6 +1004,26 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
+@@ -997,6 +1018,26 @@ func (p *AppPlayer) fetchTrack(ctx context.Context, spotId librespot.SpotifyId,
  	return stream, streamGen, nil
  }
  
@@ -70,12 +209,76 @@ index cfe8540..63c15e1 100644
  // commitLoad reports the track the player is now on. Runs on the player loop.
  func (p *AppPlayer) commitLoad(stream *player.Stream, uri string, paused bool, trackPosition int64, prefetched bool) {
  	p.primaryStream = stream
+diff --git a/daemon/framed_admission.go b/daemon/framed_admission.go
+new file mode 100644
+index 0000000..9572f96
+--- /dev/null
++++ b/daemon/framed_admission.go
+@@ -0,0 +1,58 @@
++package daemon
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"github.com/devgianlu/go-librespot/dealer"
++	"io"
++	"net"
++	"time"
++)
++
++// Admission precedes asynchronous load. Grants never appear in logs or state.
++func (p *AppPlayer) admitNative(req dealer.RequestPayload, retain bool) (bool, error) {
++	if p.app.cfg == nil || p.app.cfg.AudioBackend != "framed" {
++		return retain, nil
++	}
++	reject := errors.New("framed native admission unavailable")
++	if req.ReceivedRawNS <= 0 || p.app.cfg.FramedInstance == "" || p.app.cfg.FramedAdmissionSocket == "" {
++		return false, reject
++	}
++	ctx, cancel := context.WithTimeout(p.ctx, 500*time.Millisecond)
++	defer cancel()
++	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", p.app.cfg.FramedAdmissionSocket)
++	if err != nil {
++		return false, reject
++	}
++	defer conn.Close()
++	stop := context.AfterFunc(ctx, func() { conn.Close() })
++	defer stop()
++	conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
++	request := struct {
++		Instance string
++		Sequence uint64
++		Received int64
++		Retain   string
++	}{p.app.cfg.FramedInstance, p.app.framedSequence.Add(1), req.ReceivedRawNS, ""}
++	if retain {
++		request.Retain = p.framedGrant
++	}
++	if json.NewEncoder(conn).Encode(request) != nil {
++		return false, reject
++	}
++	var reply struct {
++		Grant    string
++		Retained bool
++	}
++	d := json.NewDecoder(io.LimitReader(conn, 256))
++	d.DisallowUnknownFields()
++	if d.Decode(&reply) != nil || len(reply.Grant) != 32 {
++		return false, reject
++	}
++	p.framedGrant = reply.Grant
++	if !reply.Retained && p.player != nil {
++		p.clearUpcoming()
++	}
++	return reply.Retained, nil
++}
 diff --git a/daemon/framed_test.go b/daemon/framed_test.go
 new file mode 100644
-index 0000000..c0eacef
+index 0000000..2828ded
 --- /dev/null
 +++ b/daemon/framed_test.go
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,281 @@
 +//go:build test_unit
 +
 +package daemon
@@ -87,6 +290,7 @@ index 0000000..c0eacef
 +	"errors"
 +	"fmt"
 +	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/dealer"
 +	"github.com/devgianlu/go-librespot/player"
 +	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
 +	"io"
@@ -277,9 +481,241 @@ index 0000000..c0eacef
 +		t.Fatalf("canceled borrowed source changed: %v seeks=%d close=%d", e, decoder.seeks, decoder.closed)
 +	}
 +}
++
++func TestNativeFramedCommandRequiresAdmissionBeforeActive(t *testing.T) {
++	p := newTestAppPlayer(t)
++	p.app.cfg = &Config{AudioBackend: "framed"}
++	req := dealer.RequestPayload{}
++	req.Command.Endpoint = "transfer"
++	if err := p.handlePlayerCommand(req); err == nil {
++		t.Fatal("native transfer became active without admission")
++	}
++}
++
++func TestNativeFramedGrantPrecedesHandlerActivationAndTagsSource(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "grant.sock")
++	listener, e := net.Listen("unix", path)
++	if e != nil {
++		t.Fatal(e)
++	}
++	defer listener.Close()
++	received := make(chan struct {
++		Instance string
++		Sequence uint64
++		Received int64
++		Retain   string
++	}, 1)
++	release := make(chan struct{})
++	go func() {
++		c, e := listener.Accept()
++		if e != nil {
++			return
++		}
++		defer c.Close()
++		var r struct {
++			Instance string
++			Sequence uint64
++			Received int64
++			Retain   string
++		}
++		json.NewDecoder(c).Decode(&r)
++		received <- r
++		<-release
++		json.NewEncoder(c).Encode(map[string]any{"Grant": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "Retained": false})
++	}()
++	p := newTestAppPlayer(t)
++	p.ctx = context.Background()
++	p.app.cfg = &Config{AudioBackend: "framed", FramedInstance: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", FramedAdmissionSocket: path}
++	req := dealer.RequestPayload{ReceivedRawNS: dealer.FramedRawNow()}
++	req.Command.Endpoint = "transfer"
++	done := make(chan error, 1)
++	go func() { done <- p.handlePlayerCommand(req) }()
++	var marker int64
++	select {
++	case r := <-received:
++		marker = r.Received
++		if r.Instance != p.app.cfg.FramedInstance || r.Sequence != 1 || r.Retain != "" {
++			t.Fatal("incorrect native command authority")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("handler did not request grant")
++	}
++	select {
++	case e := <-done:
++		t.Fatalf("handler activated before grant: %v", e)
++	default:
++	}
++	if marker != req.ReceivedRawNS {
++		t.Fatal("receive timestamp replaced after command queue")
++	}
++	close(release)
++	if e = <-done; e != nil {
++		t.Fatal(e)
++	}
++	stream := frameTestStream()
++	stream.FramedGrant, stream.FramedInstance = p.framedGrant, p.app.cfg.FramedInstance
++	var fields map[string]string
++	json.Unmarshal([]byte(stream.FramedSource(stream.Source).(interface{ FramedIdentity() string }).FramedIdentity()), &fields)
++	if fields["admission"] != p.framedGrant || fields["instance"] != p.app.cfg.FramedInstance {
++		t.Fatal("source lost admission authority")
++	}
++}
+diff --git a/daemon/player.go b/daemon/player.go
+index 12e2af9..53c17bb 100644
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -40,8 +40,9 @@ import (
+ // stops the dealer socket being read, and delays the state pushes controllers
+ // rely on to know the device is alive.
+ type AppPlayer struct {
+-	app  *App
+-	sess *session.Session
++	framedGrant string
++	app         *App
++	sess        *session.Session
+ 
+ 	ctx    context.Context
+ 	cancel context.CancelFunc
+@@ -403,6 +404,9 @@ func (p *AppPlayer) handlePlayerCommand(req dealer.RequestPayload) error {
+ 	switch req.Command.Endpoint {
+ 	case "transfer":
+ 		if len(req.Command.Data) == 0 {
++			if _, err := p.admitNative(req, false); err != nil {
++				return err
++			}
+ 			p.app.server.Emit(&ApiEvent{
+ 				Type: ApiEventTypeActive,
+ 			})
+@@ -414,6 +418,10 @@ func (p *AppPlayer) handlePlayerCommand(req dealer.RequestPayload) error {
+ 		if err := proto.Unmarshal(req.Command.Data, &transferState); err != nil {
+ 			return fmt.Errorf("failed unmarshalling TransferState: %w", err)
+ 		}
++		continued, err := p.admitNative(req, p.transferContinues(req, &transferState))
++		if err != nil {
++			return err
++		}
+ 		p.state.activationTimestamp = transferState.Playback.Timestamp
+ 
+ 		// A queued or autoplayed track is handed over on its own, with no
+@@ -448,7 +456,7 @@ func (p *AppPlayer) handlePlayerCommand(req dealer.RequestPayload) error {
+ 		// A Jam's changes arrive as transfers of the whole Jam, one for every
+ 		// song a participant adds, while the track they name goes on playing.
+ 		// Taking those over must not restart it.
+-		if p.transferContinues(req, &transferState) {
++		if continued {
+ 			p.app.log.Debugf("transfer carries on %s, keeping its stream", p.primaryStream.RequestedId.Uri())
+ 			p.transferContext(&transferState, req.SentByDeviceId, pause, true)
+ 			return nil
+@@ -492,6 +500,9 @@ func (p *AppPlayer) handlePlayerCommand(req dealer.RequestPayload) error {
+ 
+ 		return nil
+ 	case "play":
++		if _, err := p.admitNative(req, false); err != nil {
++			return err
++		}
+ 		p.state.takeOver()
+ 
+ 		p.state.player.PlayOrigin = req.Command.PlayOrigin
+diff --git a/dealer/dealer.go b/dealer/dealer.go
+index 57c4ecb..fbff233 100644
+--- a/dealer/dealer.go
++++ b/dealer/dealer.go
+@@ -210,12 +210,14 @@ loop:
+ 				continue
+ 			}
+ 
++			received := FramedRawNow()
+ 			var message RawMessage
+ 			if err := json.Unmarshal(messageBytes, &message); err != nil {
+ 				d.log.WithError(err).Error("failed unmarshalling dealer message")
+ 				break loop
+ 			}
+ 
++			message.ReceivedRawNS = received
+ 			switch message.Type {
+ 			case "message":
+ 				d.handleMessage(&message)
+diff --git a/dealer/framed_clock_linux.go b/dealer/framed_clock_linux.go
+new file mode 100644
+index 0000000..236e1ae
+--- /dev/null
++++ b/dealer/framed_clock_linux.go
+@@ -0,0 +1,12 @@
++package dealer
++
++import "golang.org/x/sys/unix"
++
++// FramedRawNow shares CLOCK_MONOTONIC_RAW with the local admission controller.
++func FramedRawNow() int64 {
++	var t unix.Timespec
++	if unix.ClockGettime(unix.CLOCK_MONOTONIC_RAW, &t) != nil {
++		return 0
++	}
++	return t.Nano()
++}
+diff --git a/dealer/framed_clock_other.go b/dealer/framed_clock_other.go
+new file mode 100644
+index 0000000..0fea317
+--- /dev/null
++++ b/dealer/framed_clock_other.go
+@@ -0,0 +1,5 @@
++//go:build !linux
++
++package dealer
++
++func FramedRawNow() int64 { return 0 }
+diff --git a/dealer/msg.go b/dealer/msg.go
+index 1d72771..08d67c7 100644
+--- a/dealer/msg.go
++++ b/dealer/msg.go
+@@ -1,14 +1,15 @@
+ package dealer
+ 
+ type RawMessage struct {
+-	Type         string            `json:"type"`
+-	Method       string            `json:"method"`
+-	Uri          string            `json:"uri"`
+-	Headers      map[string]string `json:"headers"`
+-	MessageIdent string            `json:"message_ident"`
+-	Key          string            `json:"key"`
+-	Payloads     []interface{}     `json:"payloads"`
+-	Payload      struct {
++	ReceivedRawNS int64             `json:"-"`
++	Type          string            `json:"type"`
++	Method        string            `json:"method"`
++	Uri           string            `json:"uri"`
++	Headers       map[string]string `json:"headers"`
++	MessageIdent  string            `json:"message_ident"`
++	Key           string            `json:"key"`
++	Payloads      []interface{}     `json:"payloads"`
++	Payload       struct {
+ 		Compressed []byte `json:"compressed"`
+ 	} `json:"payload"`
+ }
+diff --git a/dealer/recv.go b/dealer/recv.go
+index 568182e..cf9602f 100644
+--- a/dealer/recv.go
++++ b/dealer/recv.go
+@@ -40,6 +40,7 @@ func (req Request) Reply(success bool) {
+ }
+ 
+ type RequestPayload struct {
++	ReceivedRawNS  int64  `json:"-"`
+ 	MessageId      uint32 `json:"message_id"`
+ 	SentByDeviceId string `json:"sent_by_device_id"`
+ 	Command        struct {
+@@ -249,6 +250,8 @@ func (d *Dealer) handleRequest(rawMsg *RawMessage) {
+ 		return
+ 	}
+ 
++	payload.ReceivedRawNS = rawMsg.ReceivedRawNS
++
+ 	// keep the command's raw JSON around too, so a command we don't model
+ 	// yet can still be inspected in full (see RawCommand)
+ 	var rawEnvelope struct {
 diff --git a/output/driver-framed.go b/output/driver-framed.go
 new file mode 100644
-index 0000000..45ae731
+index 0000000..5b38c78
 --- /dev/null
 +++ b/output/driver-framed.go
 @@ -0,0 +1,212 @@
@@ -431,7 +867,7 @@ index 0000000..45ae731
 +			PCM                []byte
 +			Terminal           string
 +			Transport          string
-+		}{1, f.nonce, g, offset, json.RawMessage(identity), reason, 44100, 2, pcm, terminal, transport}
++		}{2, f.nonce, g, offset, json.RawMessage(identity), reason, 44100, 2, pcm, terminal, transport}
 +		body, e := json.Marshal(record)
 +		if e != nil || len(body) > 32768 {
 +			f.err <- errors.New("framed record too large")
@@ -497,7 +933,7 @@ index 0000000..45ae731
 +}
 diff --git a/output/framed_test.go b/output/framed_test.go
 new file mode 100644
-index 0000000..e179dfe
+index 0000000..99fb97d
 --- /dev/null
 +++ b/output/framed_test.go
 @@ -0,0 +1,287 @@
@@ -569,7 +1005,7 @@ index 0000000..e179dfe
 +	if e = json.Unmarshal(b, &r); e != nil {
 +		t.Fatal(e)
 +	}
-+	if r.Version != 1 || len(r.Nonce) != 32 || r.Generation != 1 || r.Offset != 0 || len(r.PCM) != 8 || binary.LittleEndian.Uint32(r.PCM) != 0x3e800000 {
++	if r.Version != 2 || len(r.Nonce) != 32 || r.Generation != 1 || r.Offset != 0 || len(r.PCM) != 8 || binary.LittleEndian.Uint32(r.PCM) != 0x3e800000 {
 +		t.Fatalf("wrong record: %+v", r)
 +	}
 +	// A consumer withholding reads must not hold Pause/Drop/Close forever.
@@ -1087,10 +1523,10 @@ index 0000000..7e42acd
 +}
 diff --git a/player/framed_stream_test.go b/player/framed_stream_test.go
 new file mode 100644
-index 0000000..bf09bb5
+index 0000000..13c8f33
 --- /dev/null
 +++ b/player/framed_stream_test.go
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,57 @@
 +package player
 +
 +import (
@@ -1146,6 +1582,8 @@ index 0000000..bf09bb5
 +		t.Fatalf("borrowed decoder alias promoted again: generation %d -> %d reason %s error %v", g, next, reason, e)
 +	}
 +}
++
++func TestFramedArtworkAttachedAndClearedWithSourceIdentity(t *testing.T){name:="artwork";file:=[]byte{0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19};s:=&Stream{RequestedId:librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeTrack,make([]byte,16)),Media:librespot.NewMediaFromTrack(&metadatapb.Track{Name:&name,Album:&metadatapb.Album{Cover:[]*metadatapb.Image{{FileId:file}}}})};wrapped:=s.FramedSource(&sentinel{value:.25});var m map[string]string;json.Unmarshal([]byte(wrapped.(interface{FramedIdentity()string}).FramedIdentity()),&m);if m["artwork_id"]!="spotify:image:000102030405060708090a0b0c0d0e0f10111213"||m["artwork_url"]!="https://i.scdn.co/image/000102030405060708090a0b0c0d0e0f10111213"{t.Fatalf("framed source omitted immutable artwork: %+v",m)};s.Media.Track().Album.Cover=nil;var frozen map[string]string;json.Unmarshal([]byte(wrapped.(interface{FramedIdentity()string}).FramedIdentity()),&frozen);if frozen["artwork_id"]!=m["artwork_id"]{t.Fatal("artwork mutated after installation")};next:=&Stream{RequestedId:s.RequestedId,Media:s.Media};var cleared map[string]string;json.Unmarshal([]byte(next.FramedSource(&sentinel{}).(interface{FramedIdentity()string}).FramedIdentity()),&cleared);if cleared["artwork_url"]!=""||cleared["artwork_id"]!=""{t.Fatal("missing art retained previous source artwork")}}
 diff --git a/player/player.go b/player/player.go
 index 8d45e52..7b82117 100644
 --- a/player/player.go
@@ -1380,13 +1818,14 @@ index 5611067..6da2a7f 100644
 +	return nil
 +}
 diff --git a/player/stream.go b/player/stream.go
-index 13df76b..0d680a4 100644
+index 13df76b..00d5f70 100644
 --- a/player/stream.go
 +++ b/player/stream.go
-@@ -2,12 +2,17 @@ package player
+@@ -2,13 +2,20 @@ package player
  
  import (
  	"bytes"
++	"encoding/hex"
 +	"encoding/json"
 +	"strings"
 +	"sync"
@@ -1396,12 +1835,15 @@ index 13df76b..0d680a4 100644
  )
  
  type Stream struct {
-+	framedMu   sync.Mutex
-+	framedBase *framedSource
- 	PlaybackId []byte
+-	PlaybackId []byte
++	FramedGrant, FramedInstance string
++	framedMu                    sync.Mutex
++	framedBase                  *framedSource
++	PlaybackId                  []byte
  
  	// RequestedId is the id this stream was created for, before any relinking
-@@ -45,3 +50,64 @@ func (s *Stream) Is(id librespot.SpotifyId) bool {
+ 	// to an alternative track. Callers keep referring to the stream by the id
+@@ -45,3 +52,82 @@ func (s *Stream) Is(id librespot.SpotifyId) bool {
  		return false
  	}
  }
@@ -1417,7 +1859,7 @@ index 13df76b..0d680a4 100644
 +	if _, ok := source.(*framedSource); ok {
 +		return source
 +	}
-+	fields := map[string]string{"uri": s.RequestedId.Uri(), "title": s.Media.Name()}
++	fields := map[string]string{"admission": s.FramedGrant, "instance": s.FramedInstance, "uri": s.RequestedId.Uri(), "title": s.Media.Name()}
 +	if s.Media.IsTrack() {
 +		t := s.Media.Track()
 +		if t.Album != nil {
@@ -1425,6 +1867,24 @@ index 13df76b..0d680a4 100644
 +		}
 +		if len(t.Artist) > 0 {
 +			fields["artist"] = t.Artist[0].GetName()
++		}
++	}
++	var images []*metadatapb.Image
++	if s.Media.IsTrack() {
++		album := s.Media.Track().GetAlbum()
++		images = album.GetCover()
++		if len(images) == 0 {
++			images = album.GetCoverGroup().GetImage()
++		}
++	} else if s.Media.IsEpisode() {
++		images = s.Media.Episode().GetCoverImage().GetImage()
++	}
++	for _, image := range images[:min(len(images), 16)] {
++		if len(image.GetFileId()) == 20 {
++			id := hex.EncodeToString(image.GetFileId())
++			fields["artwork_id"] = "spotify:image:" + id
++			fields["artwork_url"] = "https://i.scdn.co/image/" + id
++			break
 +		}
 +	}
 +	for k, v := range fields {

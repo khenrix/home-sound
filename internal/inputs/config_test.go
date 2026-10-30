@@ -57,3 +57,18 @@ func TestPrivateStateRejectsSymlinkAncestors(t *testing.T) {
 		t.Fatal("rejected path still wrote state")
 	}
 }
+
+func TestSpotifyRequiresDistinctExplicitDiscoveryPorts(t *testing.T) {
+	c := Config{Version: 1, StateDir: t.TempDir(), Interface: "lo", Spotify: SpotifyConfig{Enabled: true, Ports: [2]int{38401, 38402}}, Volume: VolumeConfig{MinDB: -50, MaxDB: -30, Initial: 20}}
+	if c.Validate() == nil {
+		t.Fatal("ephemeral Spotify discovery port accepted")
+	}
+	c.Spotify.ZeroconfPorts = [2]int{38421, 38422}
+	if e := c.Validate(); e != nil {
+		t.Fatal(e)
+	}
+	c.Spotify.ZeroconfPorts[0] = 38401
+	if c.Validate() == nil {
+		t.Fatal("native discovery collides with private REST port")
+	}
+}

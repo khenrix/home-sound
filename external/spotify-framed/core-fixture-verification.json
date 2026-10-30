@@ -1,17 +1,18 @@
 {
-  "purpose": "Separate GPL actual-source test overlay; production helper unchanged",
+  "purpose": "Separate GPL actual native-command/admission/switching-source/output test overlay; no production daemon execution",
   "source_commit": "90a4fdaf0314269e3fa25698a5f4270c026d2c03",
-  "production_patch_sha256": "d5e324373c6ae4e0852ce15313e04f25594ab78fee29280f04ef866c8027b1b2",
-  "production_binary_sha256": "96597e3c85cd195694bda010421f39e044975a794385b1865cebcce517d83649",
-  "fixture_source_sha256": "c786f19a3083c5e415cd9f73971f2b5231fad8e6d49aaa77e59e2df39ebf226c",
-  "observed_fixture_binary_sha256": "7c2d33dd8781a818e7e558bbdf4842a5193196c4f9a8272cd4ea63d74a399ffc",
+  "production_patch_sha256": "b82b83a5231a80f00999c7182988ef5d190385d2774c14df432da115225170a6",
+  "production_binary_sha256": "14709a9427a39ad6bea246d8103c839f6ad38cd76eac2153a756e4d18cbb90fb",
+  "fixture_source_sha256": "e4388a2e69992736abc4a3e403611c96b378438295b0eb0f0fe5d9429549b384",
+  "observed_fixture_binary_sha256": "520f73709b1684397dd47aa300c5d54e2e2f7e48015fd7c0b65fe2315518fec9",
   "toolchain": "go1.27.3 linux/amd64",
-  "build": "go test -race -tags test_unit -overlay <generated mapping> -c ./player",
+  "build": "go test -race -tags test_unit -overlay <generated mapping> -c ./daemon",
   "native_dependencies": "build-dependencies.json",
   "tests": [
     "TestActualPatchedHelperToCoreSubprocess",
     "TestActualPrefetchKeepsEngineOutputsAndConverter",
-    "TestActualHelperSustainsRealtimeWithBoundedCredit"
+    "TestActualHelperSustainsRealtimeWithBoundedCredit",
+    "TestActualNativeQueuedTransferRevokedAndFreshRecast"
   ],
   "native_acceptance": false
 }

@@ -56,3 +56,57 @@ func TestSourceMetadataWaitsForContentBoundary(t *testing.T) {
 	c.advance(1500 * time.Millisecond)
 	eventually(t, func() bool { return e.Status().Metadata.Title == "next track" })
 }
+
+type artworkSource struct {
+	eventSource
+	metadata airplay.Metadata
+}
+
+func (s *artworkSource) Metadata() airplay.Metadata { return s.metadata }
+func TestArtworkReachesStatusAndOutputAndClearsOnReplacement(t *testing.T) {
+	e, _, f := setup(t)
+	art := airplay.Metadata{Title: "first", ArtworkID: "spotify:image:0123456789abcdef0123456789abcdef01234567", ArtworkURL: "https://i.scdn.co/image/0123456789abcdef0123456789abcdef01234567"}
+	first := &artworkSource{eventSource: eventSource{events: make(chan SourceEvent, 4)}, metadata: art}
+	selectSource(t, e, config.AllSpeakers, first)
+	eventually(t, func() bool {
+		status := e.Status()
+		o := f.latest("hall")
+		if o == nil {
+			return false
+		}
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		return o.metadata == art && status.Metadata == art
+	})
+	invalid := art
+	invalid.ArtworkURL = "https://127.0.0.1/private"
+	first.events <- SourceEvent{Kind: "metadata", Metadata: invalid}
+	time.Sleep(20 * time.Millisecond)
+	if e.Status().Metadata != art {
+		t.Fatal("invalid artwork entered status")
+	}
+	next := &artworkSource{eventSource: eventSource{events: make(chan SourceEvent, 4)}, metadata: airplay.Metadata{Title: "clear"}}
+	selectSource(t, e, config.AllSpeakers, next)
+	first.events <- SourceEvent{Kind: "metadata", Metadata: art}
+	eventually(t, func() bool {
+		status := e.Status()
+		o := f.latest("hall")
+		if o == nil {
+			return false
+		}
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		return o.metadata.Title == "clear" && o.metadata.ArtworkURL == "" && status.Metadata.ArtworkID == ""
+	})
+	nextArt := airplay.Metadata{Title: "video", ArtworkID: "youtube:video:abcdefghijk", ArtworkURL: "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg"}
+	next.events <- SourceEvent{Kind: "metadata", Metadata: nextArt}
+	eventually(t, func() bool {
+		status := e.Status()
+		o := f.latest("hall")
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		return o.metadata == nextArt && status.Metadata == nextArt
+	})
+	next.events <- SourceEvent{Kind: "metadata", Metadata: airplay.Metadata{Title: "clear again"}}
+	eventually(t, func() bool { return e.Status().Metadata.ArtworkURL == "" })
+}

@@ -9,7 +9,6 @@ import (
 	"github.com/khenrix/home-sound/internal/config"
 	"github.com/khenrix/home-sound/internal/session"
 	"math"
-	"strings"
 	"sync"
 )
 
@@ -38,6 +37,9 @@ type Coordinator struct {
 	sink            Sink
 	policy          func(int) (float64, error)
 	epoch           uint64
+	sinkEpoch       uint64
+	clock           session.Clock
+	admissionFloor  int64
 	owner           Lease
 	stream          *eventStream
 	release         func()
@@ -53,7 +55,8 @@ type Coordinator struct {
 }
 
 func NewCoordinator(s Sink, p func(int) (float64, error)) *Coordinator {
-	return &Coordinator{sink: s, policy: p, instances: map[string]string{}, generations: map[string]uint64{}}
+	clock, _ := session.NewRawClock()
+	return &Coordinator{clock: clock, sink: s, policy: p, instances: map[string]string{}, generations: map[string]uint64{}}
 }
 func (id Identity) key() string { return id.Provider + "/" + id.Group }
 func (id Identity) valid() bool {
@@ -88,6 +91,9 @@ func (c *Coordinator) reserveLocked(id Identity, cancel func()) (Lease, error) {
 	}
 	if id.Generation <= c.generations[id.key()] {
 		return Lease{}, errors.New("stale input generation")
+	}
+	if c.clock != nil {
+		c.admissionFloor = int64(c.clock.Now())
 	}
 	old, oldRelease, oldStream := c.owner, c.release, c.stream
 	c.epoch++
@@ -129,7 +135,8 @@ func (c *Coordinator) commitLocked(l Lease, s session.Source, paused bool, targe
 	}
 	wrapped := &eventStream{Source: s, events: make(chan session.SourceEvent, 8), ready: make(chan struct{})}
 	defer close(wrapped.ready)
-	if _, e := c.sink.Select(session.Selection{Group: l.Group, Source: wrapped, TargetDB: &target}); e != nil {
+	sinkEpoch, e := c.sink.Select(session.Selection{Group: l.Group, Source: wrapped, TargetDB: &target})
+	if e != nil {
 		wrapped.Close()
 		if c.release != nil {
 			c.release()
@@ -138,6 +145,7 @@ func (c *Coordinator) commitLocked(l Lease, s session.Source, paused bool, targe
 		c.release = nil
 		return e
 	}
+	c.sinkEpoch = sinkEpoch
 	c.stream = wrapped
 	c.target = &target
 	if e := c.sink.Mute(c.muted); e != nil {
@@ -190,10 +198,8 @@ func (c *Coordinator) Metadata(l Lease, m airplay.Metadata) bool {
 	if !c.current(l) || c.stream == nil {
 		return false
 	}
-	for _, v := range []string{m.Title, m.Artist, m.Album} {
-		if len(v) > 1024 || strings.ContainsAny(v, "\r\n\x00") {
-			return false
-		}
+	if m.Validate() != nil {
+		return false
 	}
 	c.stream.event(session.SourceEvent{Kind: "metadata", Metadata: m})
 	return true
@@ -246,6 +252,9 @@ func (c *Coordinator) End(l Lease) bool {
 	defer c.mu.Unlock()
 	if !c.current(l) {
 		return false
+	}
+	if c.clock != nil {
+		c.admissionFloor = int64(c.clock.Now())
 	}
 	release := c.release
 	c.owner = Lease{}
@@ -343,6 +352,9 @@ func (s *eventStream) Read(ctx context.Context) (audio.Frame, error) {
 func (c *Coordinator) Exclusive(action func() error) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.clock != nil {
+		c.admissionFloor = int64(c.clock.Now())
+	}
 	release := c.release
 	c.owner = Lease{}
 	c.release = nil
@@ -368,10 +380,8 @@ func (c *Coordinator) Advance(l Lease, generation, sample uint64, m airplay.Meta
 	if !c.current(l) || c.stream == nil || generation <= l.Generation {
 		return Lease{}, errors.New("stale natural boundary")
 	}
-	for _, v := range []string{m.Title, m.Artist, m.Album} {
-		if len(v) > 1024 || strings.ContainsAny(v, "\r\n\x00") {
-			return Lease{}, errors.New("invalid boundary metadata")
-		}
+	if m.Validate() != nil {
+		return Lease{}, errors.New("invalid boundary metadata")
 	}
 	event := session.SourceEvent{Kind: "metadata", Metadata: m, Sample: &sample}
 	select {
@@ -419,4 +429,78 @@ func (c *Coordinator) SetMuted(muted bool) error {
 	}
 	c.muted = muted
 	return nil
+}
+
+type Presentation struct {
+	Sample                              uint64
+	Complete, Paused, Buffering, Failed bool
+}
+
+func (c *Coordinator) Presentation(l Lease) (Presentation, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.current(l) || c.stream == nil {
+		return Presentation{}, false
+	}
+	sink, ok := c.sink.(interface{ Status() session.Status })
+	if !ok {
+		return Presentation{}, false
+	}
+	s := sink.Status()
+	if s.Epoch != c.sinkEpoch {
+		return Presentation{}, false
+	}
+	return Presentation{Sample: s.PositionSample, Complete: !s.Active && s.SourceState == "ended", Paused: s.Paused, Buffering: s.Resuming, Failed: s.SourceState == "error"}, true
+}
+
+// ReserveNative linearizes genuine native commands using a shared-host raw
+// receive marker recorded before the helper's command queue. Grants are never
+// renewed from playback observations or callbacks belonging to a revoked owner.
+func (c *Coordinator) ReserveNative(id Identity, received int64, cancel func()) (Lease, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.clock == nil || received <= c.admissionFloor || received > int64(c.clock.Now()) || !id.valid() {
+		return Lease{}, errors.New("stale native admission")
+	}
+	oldRelease := c.release
+	c.release = nil
+	c.instances[id.key()] = id.Instance
+	c.generations[id.key()] = 0
+	l, e := c.reserveLocked(id, cancel)
+	if oldRelease != nil {
+		oldRelease()
+	}
+	return l, e
+}
+func (c *Coordinator) BindNative(l Lease, id Identity) (Lease, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.current(l) || c.stream != nil || !id.valid() || id.Provider != l.Provider || id.Group != l.Group {
+		return Lease{}, errors.New("revoked native admission")
+	}
+	c.owner.Identity = id
+	c.instances[id.key()] = id.Instance
+	c.generations[id.key()] = id.Generation
+	return c.owner, nil
+}
+
+// Replace requires the still-current grant, including when a seek races a handoff.
+func (c *Coordinator) Replace(old Lease, generation uint64, s session.Source, paused bool, target float64, release func()) (Lease, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.current(old) {
+		s.Close()
+		return Lease{}, errors.New("revoked source replacement")
+	}
+	id := old.Identity
+	id.Generation = generation
+	l, e := c.reserveLocked(id, nil)
+	if e != nil {
+		s.Close()
+		return Lease{}, e
+	}
+	if e = c.commitLocked(l, s, paused, target, release); e != nil {
+		return Lease{}, e
+	}
+	return l, nil
 }

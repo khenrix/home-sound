@@ -13,8 +13,8 @@ python3 - "$source_dir" "$here" "$overlay" <<'PY'
 import json,sys
 source,here,overlay=sys.argv[1:]
 with open(overlay,'w') as f:
-    json.dump({'Replace':{source+'/player/core_consumer_test.go':here+'/core-consumer-fixture.go.txt'}},f)
+    json.dump({'Replace':{source+'/daemon/core_consumer_test.go':here+'/core-consumer-fixture.go.txt'}},f)
 PY
 cd "$source_dir"
-"$go_binary" test -race -tags test_unit -overlay "$overlay" -c -o "$binary" ./player
+"$go_binary" test -race -tags test_unit -overlay "$overlay" -c -o "$binary" ./daemon
 sha256sum "$binary" "$here/core-consumer-fixture.go.txt"

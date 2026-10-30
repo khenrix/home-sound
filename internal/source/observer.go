@@ -210,3 +210,21 @@ func (o *Observer) History() []Observation {
 	defer o.mu.Unlock()
 	return append([]Observation(nil), o.history...)
 }
+
+func (o *Observer) Status() session.Status {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	active := false
+	if o.done != nil {
+		select {
+		case <-o.done:
+		default:
+			active = true
+		}
+	}
+	state := "reading"
+	if o.state.Transport == "ended" || o.state.Transport == "error" {
+		state = o.state.Transport
+	}
+	return session.Status{Epoch: o.state.Epoch, Active: active, PositionSample: o.state.Frames, NextSample: o.state.Frames, Paused: o.paused, SourceState: state}
+}
